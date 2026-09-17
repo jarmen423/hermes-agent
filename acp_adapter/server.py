@@ -273,6 +273,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
+        # Nested ``prompt()`` from background follow-ups must not wait on the
+        # same child tree the outer ``_finish_turn`` is already draining.
+        self._background_followup_sessions: set[str] = set()
 
     # ---- Connection lifecycle -----------------------------------------------
 
@@ -951,6 +954,11 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 await conn.session_update(session_id, acp.update_user_message_text(next_prompt))
             await self.prompt(prompt=[TextContentBlock(type="text", text=next_prompt)], session_id=session_id)
 
+        # TUI/CLI drain process_registry.completion_queue after a turn and start
+        # a follow-up. ACP used to return end_turn here, so hosts like T3 ended
+        # the provider turn and dropped later delegate_task results.
+        await self._run_background_followups(state, session_id)
+
         usage = None
         if any(result.get(k) is not None for k in ("prompt_tokens", "completion_tokens", "total_tokens")):
             usage = Usage(
@@ -960,6 +968,66 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             )
         await self._send_usage_update(state)
         return PromptResponse(stop_reason="cancelled" if cancelled else "end_turn", usage=usage)
+
+    def _acp_background_session_keys(self, state: SessionState, session_id: str) -> set[str]:
+        keys = {session_id}
+        agent_sid = getattr(state.agent, "session_id", None)
+        if agent_sid:
+            keys.add(str(agent_sid))
+        return {key for key in keys if key}
+
+    def _owns_background_event(self, state: SessionState, session_id: str, evt: dict) -> bool:
+        keys = self._acp_background_session_keys(state, session_id)
+        return str(evt.get("session_key") or "") in keys or str(evt.get("origin_ui_session_id") or "") in keys
+
+    def _has_live_owned_subagents(self, state: SessionState) -> bool:
+        try:
+            from tools.delegate_tool_registry import list_active_subagents
+        except Exception:
+            return False
+        owner = str(getattr(state.agent, "session_id", "") or "")
+        if not owner:
+            return False
+        return any(str(record.get("owner_agent_session_id") or "") == owner for record in list_active_subagents())
+
+    async def _run_background_followups(self, state: SessionState, session_id: str) -> None:
+        """Hold ``session/prompt`` open until owned background children deliver.
+
+        Desktop/TUI drain ``completion_queue`` after going idle and start a new
+        turn. ACP has no idle poller: returning ``end_turn`` makes the host
+        (T3) settle the provider turn, so later ``delegate_task`` results never
+        reach the parent model.
+        """
+        if session_id in self._background_followup_sessions:
+            return
+        self._background_followup_sessions.add(session_id)
+        try:
+            from tools.process_registry import process_registry
+
+            while True:
+                if state.cancel_event and state.cancel_event.is_set():
+                    return
+                drained = process_registry.drain_notifications(
+                    session_key=str(getattr(state.agent, "session_id", "") or session_id),
+                    owns_event=lambda evt: self._owns_background_event(state, session_id, evt),
+                    skip_poll_observed=False,
+                )
+                for _event, text in drained:
+                    if not (isinstance(text, str) and text.strip()):
+                        continue
+                    await self.prompt(
+                        prompt=[TextContentBlock(type="text", text=text)],
+                        session_id=session_id,
+                    )
+                if drained:
+                    continue
+                if not self._has_live_owned_subagents(state):
+                    return
+                await asyncio.sleep(0.25)
+        except Exception:
+            logger.debug("ACP background follow-up drain failed for %s", session_id, exc_info=True)
+        finally:
+            self._background_followup_sessions.discard(session_id)
 
     # ---- Session settings (ACP protocol methods) -----------------------------
 

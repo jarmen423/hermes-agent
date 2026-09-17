@@ -726,3 +726,51 @@ class TestRegisterSessionMcpServers:
         with patch("tools.mcp_tool_discovery.register_mcp_servers", side_effect=RuntimeError("boom")):
             # Should not raise
             await agent._register_session_mcp_servers(state, [server])
+
+
+class TestBackgroundFollowups:
+    """ACP must hold session/prompt until owned delegate_task children deliver."""
+
+    def test_owns_background_event_matches_acp_or_agent_session(self, agent, mock_manager):
+        state = mock_manager.create_session(cwd="/tmp")
+        state.agent.session_id = "hermes-head"
+        assert agent._owns_background_event(
+            state, "acp-sid", {"session_key": "acp-sid"}
+        )
+        assert agent._owns_background_event(
+            state, "acp-sid", {"session_key": "hermes-head"}
+        )
+        assert agent._owns_background_event(
+            state, "acp-sid", {"origin_ui_session_id": "acp-sid"}
+        )
+        assert not agent._owns_background_event(
+            state, "acp-sid", {"session_key": "other-session"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_background_followups_prompts_drained_completion(self, agent, mock_manager):
+        state = mock_manager.create_session(cwd="/tmp")
+        state.agent.session_id = "hermes-head"
+        prompted: list[str] = []
+
+        async def fake_prompt(*, prompt, session_id):
+            prompted.append(prompt[0].text)
+            return PromptResponse(stop_reason="end_turn")
+
+        agent.prompt = fake_prompt  # type: ignore[method-assign]
+        with (
+            patch(
+                "tools.process_registry.process_registry.drain_notifications",
+                side_effect=[
+                    [({"type": "async_delegation", "session_key": "hermes-head"}, "child done")],
+                    [],
+                ],
+            ),
+            patch(
+                "tools.delegate_tool_registry.list_active_subagents",
+                return_value=[],
+            ),
+        ):
+            await agent._run_background_followups(state, "acp-sid")
+        assert prompted == ["child done"]
+
