@@ -239,7 +239,7 @@ class TestSessionOps:
             picker_hints=False,
             canonical_order=True,
             pricing=False,
-            capabilities=False,
+            capabilities=True,
             refresh=False,
             probe_custom_providers=False,
             probe_current_custom_provider=False,

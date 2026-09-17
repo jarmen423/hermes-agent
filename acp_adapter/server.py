@@ -30,10 +30,35 @@ from acp_adapter.content import PromptBlock, _content_blocks_to_openai_user_cont
 from acp_adapter.events import (
     _build_plan_update_from_todo_result, make_message_cb, make_step_cb, make_thinking_cb, make_tool_progress_cb,
 )
-from acp_adapter.model_catalog import build_model_state, encode_model_choice
+from acp_adapter.model_catalog import (
+    _reasoning_meta,
+    build_model_state,
+    encode_model_choice,
+)
+
+
+def _session_reasoning_effort(state: "SessionState") -> str | None:
+    """Current effort level for model ``_meta``: the session override wins, then
+    the agent's resolved config. ``"none"`` when reasoning is disabled; ``None``
+    when nothing is configured (provider default applies)."""
+    cfg = getattr(state, "reasoning_effort", None)
+    if isinstance(cfg, str) and cfg.strip():
+        return cfg.strip().lower()
+    agent_cfg = getattr(state.agent, "reasoning_config", None)
+    if not isinstance(agent_cfg, dict):
+        return None
+    if agent_cfg.get("enabled") is False:
+        return "none"
+    effort = agent_cfg.get("effort")
+    return str(effort).strip().lower() if effort else None
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
-from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
+from acp_adapter.session import (
+    SessionManager,
+    SessionState,
+    _apply_session_reasoning,
+    _expand_acp_enabled_toolsets,
+)
 from acp_adapter.tools import build_tool_complete, build_tool_start, coerce_tool_args
 from agent.context_compressor import (COMPRESSED_SUMMARY_METADATA_KEY, ContextCompressor)
 from agent.interrupt_compat import request_hard_interrupt
@@ -293,8 +318,12 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         as ``hermes model``/TUI/dashboard) so the selector isn't just the current curated list."""
         model = str(state.model or getattr(state.agent, "model", "") or "").strip()
         provider = getattr(state.agent, "provider", None) or detect_provider() or "openrouter"
+        effort = _session_reasoning_effort(state)
         try:
-            picker = build_model_state(model, provider, str(getattr(state.agent, "base_url", "") or ""))
+            picker = build_model_state(
+                model, provider, str(getattr(state.agent, "base_url", "") or ""),
+                reasoning_effort=effort,
+            )
             if picker is not None:
                 return picker
         except Exception:
@@ -303,7 +332,12 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         if not model:
             return None
         choice = encode_model_choice(provider, model)
-        return SessionModelState(available_models=[ModelInfo(model_id=choice, name=model)], current_model_id=choice)
+        return SessionModelState(
+            available_models=[
+                ModelInfo(model_id=choice, name=model, field_meta=_reasoning_meta(True, effort))
+            ],
+            current_model_id=choice,
+        )
 
     @staticmethod
     def _resolve_model_selection(raw_model: str, current_provider: str) -> tuple[str, str]:
@@ -930,12 +964,32 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     # ---- Session settings (ACP protocol methods) -----------------------------
 
     async def set_session_model(self, model_id: str, session_id: str, **kwargs: Any) -> SetSessionModelResponse | None:
-        """Switch the model for a session (called by ACP protocol)."""
+        """Switch the model for a session (called by ACP protocol).
+
+        ``reasoningEffort`` arrives flattened from the request's ``_meta``
+        (ACP clients send it beside ``model_id`` when the picker changes the
+        reasoning level); it is stored on the session and applied to the live
+        agent's ``reasoning_config`` after the model rebuild."""
         state = self.session_manager.get_session(session_id)
         if state:
             _old, requested_provider, resolved_model = self._switch_model(state, model_id, keep_endpoint=True)
+            effort = kwargs.get("reasoningEffort")
+            if effort is not None:
+                from hermes_constants import parse_reasoning_effort
+
+                normalized = str(effort).strip().lower()
+                # Store only levels Hermes can parse; a junk token must not
+                # silently replace a working session override.
+                if normalized and parse_reasoning_effort(normalized) is not None:
+                    state.reasoning_effort = normalized
+                    self.session_manager.save_session(session_id)
+            # The override is session-scoped: it must re-apply after every agent
+            # rebuild, or the advertised current effort would lie about what
+            # the rebuilt agent actually sends.
+            _apply_session_reasoning(state)
             logger.info(
-                "Session %s: model switched to %s via provider %s", session_id, resolved_model, requested_provider
+                "Session %s: model switched to %s via provider %s (reasoning_effort=%s)",
+                session_id, resolved_model, requested_provider, state.reasoning_effort,
             )
             return SetSessionModelResponse()
         logger.warning("Session %s: model switch requested for missing session", session_id)

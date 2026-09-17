@@ -143,6 +143,25 @@ class SessionState:
     runtime_lock: Any = field(default_factory=threading.Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
+    # Session-scoped reasoning-effort override (level string such as "high",
+    # or "none" to disable) — set by ACP ``session/set_model`` meta and applied
+    # to ``agent.reasoning_config``; survives model rebuilds and restores.
+    reasoning_effort: str | None = None
+
+
+def _apply_session_reasoning(state: "SessionState") -> None:
+    """Apply ``state.reasoning_effort`` to the live agent's reasoning_config.
+
+    Called after agent construction/rebuild and on session restore; a ``None``
+    or unparseable level leaves the config-resolved value in place."""
+    try:
+        from hermes_constants import parse_reasoning_effort
+
+        parsed = parse_reasoning_effort(state.reasoning_effort)
+        if parsed is not None:
+            state.agent.reasoning_config = parsed
+    except Exception:
+        logger.debug("Could not apply session reasoning_effort", exc_info=True)
 
 
 class SessionManager:
@@ -286,6 +305,8 @@ class SessionManager:
         # Ensure model is a plain string (not a MagicMock or other proxy).
         model_str = str(state.model) if state.model else None
         session_meta = {"cwd": state.cwd}
+        if isinstance(state.reasoning_effort, str) and state.reasoning_effort.strip():
+            session_meta["reasoning_effort"] = state.reasoning_effort.strip().lower()
         for key in ("provider", "base_url", "api_mode"):
             value = getattr(state.agent, key, None)
             if isinstance(value, str) and value.strip():
@@ -297,7 +318,7 @@ class SessionManager:
                     # Empty editor probes stay ephemeral; copied fork history persists.
                     return
                 db.create_session(session_id=state.session_id, source="acp", model=model_str,
-                                  model_config={"cwd": state.cwd})
+                                  model_config=session_meta)
             else:
                 try:
                     db.update_session_meta(state.session_id, json.dumps(session_meta), model_str)
@@ -362,6 +383,10 @@ class SessionManager:
             return None
         state = self._install_state(session_id, agent, cwd, model or getattr(agent, "model", "") or "",
                                     history, persist=False)
+        restored_effort = meta.get("reasoning_effort")
+        if isinstance(restored_effort, str) and restored_effort.strip():
+            state.reasoning_effort = restored_effort.strip().lower()
+            _apply_session_reasoning(state)
         logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
         return state
 

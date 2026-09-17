@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
 from acp.schema import ModelInfo, SessionModelState
 
@@ -127,6 +127,44 @@ def _empty_catalog_applies(
     )
 
 
+# Reasoning-effort vocabulary advertised in ``ModelInfo._meta`` for ACP clients.
+# ``none`` disables reasoning; the rest mirror ``VALID_REASONING_EFFORTS`` —
+# providers clamp unsupported levels at request time, so the full ladder is the
+# honest surface (the picker is a request preference, not a capability promise).
+ACP_REASONING_EFFORTS: tuple[tuple[str, str], ...] = (
+    ("none", "Off"),
+    ("minimal", "Minimal"),
+    ("low", "Low"),
+    ("medium", "Medium"),
+    ("high", "High"),
+    ("xhigh", "Extra High"),
+    ("max", "Max"),
+    ("ultra", "Ultra"),
+)
+
+
+def _reasoning_meta(reasoning_supported: bool, current_effort: str | None) -> dict | None:
+    """``ModelInfo._meta`` describing the reasoning-effort surface for a model.
+
+    Keys follow the convention ACP clients read: ``supportsReasoningEffort``
+    gates the picker entirely, ``reasoningEfforts`` lists selectable levels,
+    ``reasoningEffort`` is the session's current level (``default`` marks it).
+    """
+    if not reasoning_supported:
+        return {"supportsReasoningEffort": False}
+    current = (current_effort or "").strip().lower() or None
+    meta: dict[str, Any] = {
+        "supportsReasoningEffort": True,
+        "reasoningEfforts": [
+            {"value": value, "label": label, "default": value == current}
+            for value, label in ACP_REASONING_EFFORTS
+        ],
+    }
+    if current:
+        meta["reasoningEffort"] = current
+    return meta
+
+
 def _choice_provider(model_id: str) -> str:
     """Provider prefix of an encoded choice id; longest configured ``custom:`` slug wins."""
     parts = model_id.split(":")
@@ -164,6 +202,7 @@ class _ModelCatalog:
     current_model: str
     current_choice_provider: str
     current_base_url: str
+    current_reasoning_effort: str | None = None
     models: list[ModelInfo] = field(default_factory=list)
     seen_ids: set[str] = field(default_factory=set)
     seen_semantic_ids: set[str] = field(default_factory=set)
@@ -177,12 +216,18 @@ class _ModelCatalog:
     def semantic(self, provider_id: str) -> str:
         return _semantic_provider(provider_id, self.normalize_provider)
 
-    def add(self, provider_id: str, model_id: str, name: str, description: str) -> None:
+    def add(
+        self, provider_id: str, model_id: str, name: str, description: str,
+        reasoning_supported: bool = True,
+    ) -> None:
         choice_id = encode_model_choice(provider_id, model_id)
         semantic_id = f"{self.semantic(provider_id)}:{model_id}"
         if not choice_id or choice_id in self.seen_ids or semantic_id in self.seen_semantic_ids:
             return
-        self.models.append(ModelInfo(model_id=choice_id, name=name, description=description))
+        self.models.append(ModelInfo(
+            model_id=choice_id, name=name, description=description,
+            field_meta=_reasoning_meta(reasoning_supported, self.current_reasoning_effort),
+        ))
         self.seen_ids.add(choice_id)
         self.seen_semantic_ids.add(semantic_id)
 
@@ -216,9 +261,15 @@ class _ModelCatalog:
                 is_current = rendered_model == self.current_model and (
                     self.semantic(encoded_provider) == self.semantic(self.current_choice_provider)
                 )
+                row_caps = row.get("capabilities") or {}
+                model_caps = row_caps.get(rendered_model) if isinstance(row_caps, dict) else None
+                reasoning_supported = (
+                    bool(model_caps.get("reasoning")) if isinstance(model_caps, dict) else True
+                )
                 self.add(
                     encoded_provider, rendered_model, f"{provider_name} · {rendered_model}",
                     f"Provider: {provider_name}" + (" • current" if is_current else ""),
+                    reasoning_supported,
                 )
 
     def add_named_catalogs(self, catalogs: list, normalized_provider: str) -> None:
@@ -235,9 +286,14 @@ class _ModelCatalog:
                 self.add(named_slug, named_model, named_model, " • ".join(part for part in parts if part))
 
 
-def build_model_state(model: str, provider: str, base_url: str) -> SessionModelState | None:
+def build_model_state(
+    model: str, provider: str, base_url: str, reasoning_effort: str | None = None,
+) -> SessionModelState | None:
     """Picker state from the shared inventory + named endpoints; ``None`` when nothing is listable
-    (caller falls back to a single current-model row). Raises on inventory failure."""
+    (caller falls back to a single current-model row). Raises on inventory failure.
+
+    ``reasoning_effort`` is the session's current level — emitted per model in ``_meta`` so ACP
+    clients can render the effort picker with the right value selected."""
     from hermes_cli.inventory import build_models_payload, load_picker_context
     from hermes_cli.models import normalize_provider, provider_label
 
@@ -247,7 +303,7 @@ def build_model_state(model: str, provider: str, base_url: str) -> SessionModelS
     )
     payload = build_models_payload(
         context, explicit_only=True, include_unconfigured=False, picker_hints=False,
-        canonical_order=True, pricing=False, capabilities=False, refresh=False,
+        canonical_order=True, pricing=False, capabilities=True, refresh=False,
         probe_custom_providers=False, probe_current_custom_provider=False, max_models=ACP_MAX_MODELS_PER_PROVIDER,
     )
 
@@ -255,6 +311,7 @@ def build_model_state(model: str, provider: str, base_url: str) -> SessionModelS
         normalize_provider=normalize_provider, current_model=model,
         current_choice_provider=str(provider or "").strip().lower(),
         current_base_url=base_url.strip().rstrip("/").lower(),
+        current_reasoning_effort=reasoning_effort,
     )
     cat.add_inventory_rows(payload.get("providers") or [], provider_label)
     cat.add_named_catalogs(_named_custom_provider_catalogs(), normalized_provider)
