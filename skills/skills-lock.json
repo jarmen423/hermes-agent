@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "frontend-design-skill-router": {
+      "source": "jarmen423/skills",
+      "sourceType": "github",
+      "skillPath": "my-created-skills/frontend-design-skill-router/SKILL.md",
+      "computedHash": "66719765aa2f6fd36fb601fe46db71d187b671c463032da3bf02c03c401f1c74"
+    }
+  }
+}
