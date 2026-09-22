@@ -47,6 +47,24 @@ class TestHostHeaderValidator:
         # Loopback — reject (we bound to a specific non-loopback name)
         assert not _is_accepted_host("localhost", "my-server.corp.net")
 
+    def test_dashboard_public_hosts_parses_configured_public_url(self, monkeypatch):
+        """_dashboard_public_hosts() is the config→trust wiring: the operator-declared
+        dashboard.public_url hostname (a Tailscale Serve / reverse proxy / tunnel front
+        for OAuth redirect callbacks) becomes the trusted set; unset/garbage fails closed."""
+        from hermes_cli import web_server as ws
+        from hermes_cli.dashboard_auth import prefix as dashboard_prefix
+
+        monkeypatch.setattr(
+            dashboard_prefix, "resolve_public_url",
+            lambda: "https://M26Pipeline.tail7c213b.ts.net:9443/hermes/")
+        assert ws._dashboard_public_hosts() == frozenset({"m26pipeline.tail7c213b.ts.net"})
+
+        monkeypatch.setattr(dashboard_prefix, "resolve_public_url", lambda: "")
+        assert ws._dashboard_public_hosts() == frozenset()
+
+        monkeypatch.setattr(dashboard_prefix, "resolve_public_url", lambda: "::::")
+        assert ws._dashboard_public_hosts() == frozenset()
+
 
     def test_trusted_public_host_is_exact_match_only(self):
         """A declared proxy host is accepted without weakening rebinding checks."""

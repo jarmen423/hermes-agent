@@ -239,11 +239,19 @@ class OpenAIStreamer(StreamingTTSProvider):
 
     Compatible servers may emit another rate: ``tts.openai.pcm_sample_rate`` sets the expected
     rate up front and a rate reported by the response (``X-Audio-Sample-Rate`` / Content-Type
-    ``rate=``) overrides it before the first chunk is yielded (#76466).
+    ``rate=``) overrides it before the first chunk is yielded (#76466). Fish Audio's
+    OpenAI-compat ``pcm`` is 44.1 kHz; a fish.audio base URL selects that rate unless
+    ``pcm_sample_rate`` says otherwise.
     """
 
     def __init__(self, tts_config: Dict, section: Dict):
         super().__init__(tts_config, section)
+        from hermes_cli.config import get_env_value
+        base = str(section.get("base_url") or get_env_value("OPENAI_BASE_URL") or "")
+        if "fish.audio" in base.lower():
+            # Fish Audio's OpenAI-compat ``pcm`` is 44.1 kHz, not OpenAI's 24 kHz;
+            # an explicit ``pcm_sample_rate`` still wins below.
+            self.sample_rate = 44100
         configured = section.get("pcm_sample_rate", self.sample_rate)
         if isinstance(configured, bool) or not isinstance(configured, (int, float, str)) \
                 or not str(configured).strip().isdigit() or int(str(configured).strip()) <= 0:

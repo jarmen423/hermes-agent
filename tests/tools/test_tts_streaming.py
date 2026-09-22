@@ -966,6 +966,21 @@ def test_openai_pcm_sample_rate_resolution(config, headers, expected):
         assert ts.OpenAIStreamer({}, {"api_key": "sk-x", **config}).sample_rate == expected
 
 
+def test_openai_streamer_detects_fish_audio_native_rate(monkeypatch):
+    """Fish Audio's OpenAI-compat ``pcm`` is 44.1 kHz, not OpenAI's 24 kHz: a
+    fish.audio base URL (section or env) selects the native rate, while an
+    explicit ``pcm_sample_rate`` still wins and other hosts keep 24 kHz."""
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    assert ts.OpenAIStreamer(
+        {}, {"api_key": "sk-x", "base_url": "https://api.fish.audio/v1"}).sample_rate == 44100
+    assert ts.OpenAIStreamer(
+        {}, {"api_key": "sk-x", "base_url": "https://api.fish.audio/v1",
+             "pcm_sample_rate": "16000"}).sample_rate == 16000
+    assert ts.OpenAIStreamer({}, {"api_key": "sk-x"}).sample_rate == 24000
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.fish.audio/v1")
+    assert ts.OpenAIStreamer({}, {"api_key": "sk-x"}).sample_rate == 44100
+
+
 @pytest.mark.skipif(
     sys.platform == "darwin",
     reason="macOS deliberately skips the sounddevice OutputStream path (PR #62601)",
