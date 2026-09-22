@@ -40,6 +40,78 @@ from pathlib import Path
 # ── pure-function resolver ────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("model,expected", [
+    # NVIDIA Nemotron reasoning family (longest keys first).
+    ("nvidia/nemotron-3.5-lightning-30b-a3b", 300.0),
+    ("nvidia/nemotron-3-ultra-550b-a55b", 600.0),
+    ("nvidia/nemotron-3-super-120b-a12b", 600.0),
+    ("nvidia/nemotron-3-nano-30b-a3b", 300.0),
+    # DeepSeek R1 + DeepSeek reasoner + V4 reasoning series.
+    # V4 emits reasoning_content in a separate delta before final
+    # content (same shape as R1), so it needs the same 600s floor.
+    ("deepseek/deepseek-r1", 600.0),
+    ("deepseek/deepseek-r1-distill-llama-70b", 600.0),
+    ("deepseek/deepseek-reasoner", 600.0),
+    ("deepseek/deepseek-v4-flash", 600.0),
+    ("deepseek/deepseek-v4-pro", 600.0),
+    ("deepseek-v4-flash-free", 600.0),   # catalog -free variant inherits via separator anchor
+    # Version-less canonical Flash id from the 2026-09 Flash refresh —
+    # ``deepseek-v4-flash`` still aliases onto it server-side.
+    ("deepseek/deepseek-flash", 600.0),
+    ("deepseek-flash", 600.0),
+    # Qwen QwQ + Qwen3 thinking variants (qwen3 family entry matches all).
+    ("qwen/qwq-32b-preview", 300.0),
+    ("qwen/qwen3-235b-a22b-thinking", 180.0),
+    ("qwen/qwen3-32b", 180.0),
+    # OpenAI o-series — each variant enumerated explicitly.
+    # Longest match wins (o3-mini beats o3 on shared prefix).
+    ("openai/o1", 600.0),
+    ("openai/o1-mini", 600.0),
+    ("openai/o1-pro", 600.0),
+    ("openai/o1-preview", 600.0),
+    ("openai/o3", 600.0),
+    ("openai/o3-pro", 600.0),
+    ("openai/o3-mini", 300.0),
+    ("openai/o4-mini", 300.0),
+    # OpenAI named reasoning lines (#103802); vendor prefixes and named/-pro/-900k variants
+    # inherit via the separator anchor.
+    ("openai/gpt-5.6-sol", 600.0),
+    ("gpt-5.6-terra", 600.0),
+    ("gpt-5.6-sol-900k", 600.0),
+    ("gpt-6-astra", 600.0),
+    ("gpt-6-astra-900k", 600.0),
+    # Anthropic Claude 4.x thinking variants.
+    ("anthropic/claude-opus-4-6", 240.0),
+    ("anthropic/claude-opus-4-20250514", 240.0),
+    ("anthropic/claude-sonnet-4.5", 180.0),
+    ("anthropic/claude-sonnet-4.6", 180.0),
+    # Anthropic Mythos-class named reasoning models — deep-reasoning tier.
+    ("anthropic/claude-fable-5", 600.0),
+    ("claude-fable-5", 600.0),
+    ("claude-fable", 600.0),
+    # xAI Grok reasoning variants — explicit, not bare `grok`.
+    ("x-ai/grok-4-fast-reasoning", 300.0),
+    ("x-ai/grok-4.20-reasoning", 300.0),
+    ("x-ai/grok-4.5", 300.0),
+    ("x-ai/grok-4.6", 300.0),
+    ("x-ai/grok-4-fast-non-reasoning", 180.0),
+    # Z.AI GLM-5.3 family — thinking cannot be disabled; bare and -flash SKUs.
+    ("z-ai/glm-5.3", 300.0),
+    ("z-ai/glm-5.3-flash", 300.0),
+    # Thinking Machines Inkling — family entry covers -small and the
+    # OpenRouter :free / :batch SKU suffixes (":" is a slug separator
+    # in the right anchor, same as "-").
+    ("thinkingmachines/inkling", 300.0),
+    ("thinkingmachines/inkling:free", 300.0),
+    ("thinkingmachines/inkling-small:free", 300.0),
+])
+def test_reasoning_stale_timeout_floor_positive_cases(model, expected):
+    from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+    assert get_reasoning_stale_timeout_floor(model) == expected, (
+        f"get_reasoning_stale_timeout_floor({model!r}) should return "
+        f"{expected}; bare substrings and shared prefixes must not "
+        f"over-match community derivatives."
+    )
 
 
 

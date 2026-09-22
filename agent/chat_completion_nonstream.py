@@ -151,7 +151,14 @@ class _NonStreamRequest:
                 phase = "reconnect"
             elif last_event_ts is not None:
                 phase = "post_event"
-            watchdog = wn.codex_watchdog_deadline(stale_timeout=wd.stale_timeout,
+            # The poll loop skips the wall-clock stale kill while the Codex progress
+            # watchdogs own it (hard ceiling stays the backstop): advertise the same
+            # effective deadline so the notice never promises a reconnect that won't come.
+            owned = wd.codex and (last_event_ts is not None or wd.ttfb_enabled)
+            notice_stale = wd.stale_timeout
+            if owned:
+                notice_stale = wd.hard_timeout if wd.hard_timeout > 0 else float("inf")
+            watchdog = wn.codex_watchdog_deadline(stale_timeout=notice_stale,
                 ttfb_enabled=wd.ttfb_enabled, ttfb_timeout=wd.ttfb_timeout,
                 last_event_ts=last_event_ts, last_progress_ts=last_progress_ts,
                 retry_started_ts=retry_started_ts,
@@ -211,17 +218,18 @@ class _NonStreamRequest:
             f"Codex stream produced no SSE events for {int(event_stale_elapsed)}s "
             f"after {arm_point} (threshold: {int(wd.idle_timeout)}s)")
 
-    def _stale_kill(self, elapsed: float) -> None:
+    def _stale_kill(self, elapsed: float, *, threshold: float | None = None) -> None:
         """No response within the stale timeout: kill and count toward the
         circuit breaker (#58962, see ``_stale_streak``)."""
         agent, wd = self.agent, self.wd
+        limit = wd.stale_timeout if threshold is None else threshold
         silent_hint = h._codex_silent_hang_hint(agent, self.api_kwargs)
-        h._report_stale_nonstream_kill(agent, self.api_kwargs, elapsed, wd.stale_timeout, hint=silent_hint)
+        h._report_stale_nonstream_kill(agent, self.api_kwargs, elapsed, limit, hint=silent_hint)
         self._abort_request("stale_call_kill")
         h._bump_stale_streak(agent)
         h._touch_stale_kill_activity(agent, elapsed)
         self._await_worker_after_kill(
-            f"Non-streaming API call timed out after {int(elapsed)}s with no response (threshold: {int(wd.stale_timeout)}s)"
+            f"Non-streaming API call timed out after {int(elapsed)}s with no response (threshold: {int(limit)}s)"
             + (f". {silent_hint}" if silent_hint else ""))
 
     def _interrupt(self, elapsed: float) -> None:
@@ -277,7 +285,18 @@ class _NonStreamRequest:
                     and idle_elapsed > wd.idle_timeout):
                 self._idle_kill(idle_elapsed)
                 break
-            if elapsed > wd.stale_timeout:
+            # Responses/Codex streams already have TTFB (no first byte) and
+            # event-idle (gap after first byte, including reasoning SSE)
+            # watchdogs. The wall-clock stale timer used to fire mid-think even
+            # while events flowed, surfacing as BrokenPipeError on thinking
+            # models (glm-5.3-flash). Skip it while those watchdogs own progress;
+            # the hard ceiling (#64507) stays as the absolute backstop.
+            codex_progress_owned = wd.codex and (last_event_ts is not None or wd.ttfb_enabled)
+            if codex_progress_owned:
+                if wd.hard_timeout > 0 and elapsed > wd.hard_timeout:
+                    self._stale_kill(elapsed, threshold=wd.hard_timeout)
+                    break
+            elif elapsed > wd.stale_timeout:
                 self._stale_kill(elapsed)
                 break
             if agent._interrupt_requested:

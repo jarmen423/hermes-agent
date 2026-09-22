@@ -111,7 +111,9 @@ def test_local_endpoint_ttfb_default_uses_local_stale_ceiling(tmp_path, monkeypa
     monkeypatch.setenv("HERMES_LOCAL_STREAM_STALE_TIMEOUT", "600")
     local = _make_codex_agent(tmp_path, monkeypatch, provider="custom", base_url="http://127.0.0.1:11434/v1")
     hosted = _make_codex_agent(tmp_path, monkeypatch, provider="custom", base_url="https://api.example.com/v1")
-    kwargs = {"model": "qwen3-27b", "input": "hi"}
+    # Non-reasoning model: this test pins the local-ceiling/hosted-default split, and
+    # floor-listed thinking models (qwen3, glm-5.3, ...) raise the implicit TTFB cutoff.
+    kwargs = {"model": "llama-3.1-70b", "input": "hi"}
 
     assert h._resolve_nonstream_watchdogs(local, kwargs).ttfb_timeout == 600.0
     assert h._resolve_nonstream_watchdogs(hosted, kwargs).ttfb_timeout == 120.0

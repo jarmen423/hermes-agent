@@ -1112,7 +1112,6 @@ def _high_effort_silence_floor(agent) -> float:
         return 0.0
     return HIGH_EFFORT_SILENCE_FLOOR_SECONDS
 
-
 @dataclass
 class _NonStreamWatchdogs:
     """Poll-loop thresholds for one non-streaming request."""
@@ -1124,6 +1123,7 @@ class _NonStreamWatchdogs:
     idle_enabled: bool
     idle_timeout: float
     idle_requires_progress: bool
+    hard_timeout: float  # flat Codex ceiling (#64507); 0 disables the absolute backstop
 
 
 def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs:
@@ -1148,7 +1148,13 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
     openai_codex_backend = _is_openai_codex_backend(agent)
     est_tokens = estimate_request_context_tokens(api_kwargs)
     effort_floor = _high_effort_silence_floor(agent) if codex else 0.0
+    # Per-model reasoning floor (thinking cannot be disabled on glm-5.3; its first
+    # token routinely clears the 120s TTFB / 180s idle defaults). Raises only the
+    # implicit TTFB/idle cutoffs below; explicit values and 0=disable always win.
+    from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+    reasoning_floor = get_reasoning_stale_timeout_floor(api_kwargs.get("model"))
     codex_floor = 0.0
+    hard_timeout = 0.0
     if codex and openai_codex_backend:
         # Raise the stale floor for large payloads so healthy gateway-scale
         # requests aren't aborted mid-prefill.
@@ -1203,18 +1209,23 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
     if ttfb_enabled and not ttfb_explicit:
         # High-effort thinking precedes the first event; the floor outranks the cap.
         ttfb_timeout = max(ttfb_timeout, effort_floor)
+        if reasoning_floor is not None:
+            ttfb_timeout = max(ttfb_timeout, reasoning_floor)
 
     # An operator-set idle timeout keeps first-event semantics; only the implicit
     # default defers arming until model progress. Sentinel: env_float returns the
     # default for unset AND unparseable values, so both count as implicit.
     idle_explicit = env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", -1.0) != -1.0
     idle_timeout = env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", idle_default)
+    if codex and idle_timeout > 0 and not idle_explicit and reasoning_floor is not None:
+        idle_timeout = max(idle_timeout, reasoning_floor)
     return _NonStreamWatchdogs(stale_timeout=stale_timeout, codex=codex, est_tokens=est_tokens,
         ttfb_enabled=ttfb_enabled, ttfb_timeout=ttfb_timeout, idle_enabled=codex and idle_timeout > 0,
         idle_timeout=idle_timeout,
         idle_requires_progress=(
             codex and openai_codex_backend and codex_floor > 0 and not idle_explicit
-        ))
+        ),
+        hard_timeout=hard_timeout)
 
 
 def _codex_silent_hang_hint(agent, api_kwargs: dict) -> Optional[str]:

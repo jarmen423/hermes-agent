@@ -567,6 +567,14 @@ class AIAgent(
         for local endpoints only when the user configured nothing.
         """
         cfg = get_provider_stale_timeout(self.provider, self.model)
+        if cfg is None:
+            # Named custom providers resolve agent.provider to "custom".
+            # Look up the config key the user actually wrote (zai-responses).
+            requested = str(getattr(self, "requested_provider", "") or "").strip()
+            if requested and requested != self.provider:
+                cfg = get_provider_stale_timeout(requested, self.model)
+                if cfg is None and requested.startswith("custom:"):
+                    cfg = get_provider_stale_timeout(requested.split(":", 1)[1], self.model)
         if cfg is not None:
             return cfg, False
         env_timeout = os.getenv("HERMES_API_CALL_STALE_TIMEOUT")
@@ -608,8 +616,19 @@ class AIAgent(
     def _stale_timeout_is_explicit(self) -> bool:
         """True when the user explicitly configured the stale timeout (config or env var); implicit values
         (reasoning floors, the 90s default) yield to the run-budget cap, explicit ones never do."""
-        return (get_provider_stale_timeout(self.provider, self.model) is not None
-                or os.getenv("HERMES_API_CALL_STALE_TIMEOUT") is not None)
+        if get_provider_stale_timeout(self.provider, self.model) is not None:
+            return True
+        # Named custom providers resolve agent.provider to "custom".
+        # Look up the config key the user actually wrote (zai-responses).
+        requested = str(getattr(self, "requested_provider", "") or "").strip()
+        if requested and requested != self.provider:
+            if get_provider_stale_timeout(requested, self.model) is not None:
+                return True
+            if requested.startswith("custom:") and get_provider_stale_timeout(
+                requested.split(":", 1)[1], self.model
+            ) is not None:
+                return True
+        return os.getenv("HERMES_API_CALL_STALE_TIMEOUT") is not None
 
     def _codex_silent_hang_hint(self, model: Optional[str] = None) -> Optional[str]:
         """Actionable hint when the request matches a known Codex silent-reject shape (currently the ``gpt-5.5``

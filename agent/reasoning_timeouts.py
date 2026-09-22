@@ -39,6 +39,10 @@ _REASONING_STALE_TIMEOUT_FLOORS: dict[int, tuple[str, ...]] = {
         # xAI Grok: explicit reasoning pairs only, so bare ``grok-3``/``grok-4`` fast variants
         # don't inherit the floor.
         "grok-4-fast-reasoning", "grok-4.20-reasoning", "grok-4.5", "grok-4.6",
+        # Z.AI GLM-5.3 family — thinking cannot be disabled; first visible
+        # token routinely exceeds the 90s non-stream / 180s stream defaults
+        # (m26: wall-clock stale kill → BrokenPipeError on glm-5.3-flash).
+        "glm-5.3",
         # "Ox Alpha" stealth reasoning model (OpenRouter / OpenCode Zen slugs); Thinking
         # Machines Inkling (covers inkling-small and :free SKUs).
         "ox-alpha", "x-preview-f-free", "inkling",
