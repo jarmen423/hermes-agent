@@ -12,7 +12,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from gateway.config import PlatformConfig
 from plugins.platforms.discord.adapter import (  # noqa: E402
+    _UNAUTHORIZED,
     ChoicePickerView,
     ClarifyChoiceView,
     DiscordAdapter,
@@ -21,7 +23,6 @@ from plugins.platforms.discord.adapter import (  # noqa: E402
     SlashConfirmView,
     UpdatePromptView,
 )
-from gateway.config import PlatformConfig
 
 
 @pytest.fixture(autouse=True)
@@ -37,8 +38,12 @@ def _clear_silent_env(monkeypatch):
 
 def _interaction(user_id=99999):
     return SimpleNamespace(
-        user=SimpleNamespace(id=user_id, name=f"user_{user_id}", display_name="alice", roles=[]),
-        response=SimpleNamespace(send_message=AsyncMock(), edit_message=AsyncMock(), defer=AsyncMock()),
+        user=SimpleNamespace(
+            id=user_id, name=f"user_{user_id}", display_name="alice", roles=[]
+        ),
+        response=SimpleNamespace(
+            send_message=AsyncMock(), edit_message=AsyncMock(), defer=AsyncMock()
+        ),
         message=SimpleNamespace(embeds=[]),
         data={"values": ["x"]},
         channel_id=5,
@@ -55,15 +60,25 @@ async def _noop(*_a, **_k):
 def _views():
     return {
         "exec": ExecApprovalView(session_key="s", allowed_user_ids={"1"}),
-        "slash": SlashConfirmView(session_key="s", confirm_id="c", allowed_user_ids={"1"}),
+        "slash": SlashConfirmView(
+            session_key="s", confirm_id="c", allowed_user_ids={"1"}
+        ),
         "update": UpdatePromptView(session_key="s", allowed_user_ids={"1"}),
-        "clarify": ClarifyChoiceView(choices=["a"], clarify_id="c", allowed_user_ids={"1"}),
+        "clarify": ClarifyChoiceView(
+            choices=["a"], clarify_id="c", allowed_user_ids={"1"}
+        ),
         "model": ModelPickerView(
-            providers=[], current_model="m", current_provider="p", session_key="s",
-            on_model_selected=_noop, allowed_user_ids={"1"},
+            providers=[],
+            current_model="m",
+            current_provider="p",
+            session_key="s",
+            on_model_selected=_noop,
+            allowed_user_ids={"1"},
         ),
         "choice": ChoicePickerView(
-            choices=[{"value": "v"}], on_choice_selected=_noop, allowed_user_ids={"1"},
+            choices=[{"value": "v"}],
+            on_choice_selected=_noop,
+            allowed_user_ids={"1"},
         ),
     }
 
@@ -99,7 +114,9 @@ async def test_silent_mode_sends_nothing_on_unauthorized_click(monkeypatch, name
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("name,call", _UNAUTH_CALLS)
-async def test_silent_mode_hides_already_resolved_from_strangers(monkeypatch, name, call):
+async def test_silent_mode_hides_already_resolved_from_strangers(
+    monkeypatch, name, call
+):
     monkeypatch.setenv("DISCORD_UNAUTHORIZED_INTERACTION_BEHAVIOR", "ignore")
     view = _view_for(name)
     view.resolved = True
@@ -129,5 +146,6 @@ async def test_default_mode_still_sends_slash_denial():
     interaction = _interaction()
     assert await adapter._check_slash_authorization(interaction, "/help") is False
     interaction.response.send_message.assert_awaited_once_with(
-        "You're not authorized to use this command.", ephemeral=True,
+        _UNAUTHORIZED,
+        ephemeral=True,
     )
