@@ -31,7 +31,7 @@ from agent.prompt_caching import (
 from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED, is_runaway_repetition
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.surface_switch import (
-    identity_line_value, note_inert_pinned_tools, split_runtime_boundary, stage_surface_switch_note,
+    identity_line_value, note_inert_pinned_tools, runtime_host_value, stage_surface_switch_note,
 )
 from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
 from agent.turn_retry_state import TurnRetryState
@@ -40,7 +40,7 @@ from agent.turn_retry_state import TurnRetryState
 from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call
 from agent.turn_api_error import handle_api_error
 from agent.turn_api_request import build_api_request
-from agent.turn_failure_copy import failed_turn_notice, site_copy
+from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, failed_turn_notice, site_copy
 from agent.turn_final_response import finish_text_response
 from agent.turn_finalizer import finalize_turn
 from agent.turn_iteration_prep import (
@@ -814,20 +814,6 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     """Return False when the persisted runtime-identity lines are stale."""
-
-    _identity, runtime_marker, runtime = split_runtime_boundary(prompt)
-
-    def host_info_value(label: str) -> str:
-        """New prompts delimit runtime hints; legacy prompts put them before context."""
-        prefix = f"{label}:"
-        host_lines = (runtime.split("\n\n", 1)[0] if runtime_marker else prompt).splitlines()
-        for idx, line in enumerate(host_lines):
-            if line.startswith("User home directory:"):
-                for candidate in host_lines[idx + 1: idx + 4]:
-                    if candidate.startswith(prefix):
-                        return candidate[len(prefix):].strip()
-        return ""
-
     # Model/provider identity, then cwd drift.  A cwd change is a real content change (context
     # files, the workspace snapshot and the coding posture are all resolved from it), so it
     # still rebuilds; the runtime surface does not (agent/surface_switch.py).
@@ -836,9 +822,15 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
         current = str(getattr(agent, attr, "") or "").strip()
         if stored and current and stored != current:
             return False
+    # A prompt stamped for another session (a /branch child copies its parent's bytes) must not
+    # tell the model a foreign Session ID.  Checked only when the trailer is on: with it off, a
+    # "Session ID:" line in project text would read as a mismatch and rebuild every turn.
+    stored_sid = identity_line_value(prompt, "Session ID")
+    if stored_sid and getattr(agent, "pass_session_id", False) and stored_sid != agent.session_id:
+        return False
     # Compare against resolve_agent_cwd() — the SAME resolver used to build the
     # prompt — so TERMINAL_CWD sessions are not falsely rejected.
-    stored_cwd = host_info_value("Current working directory")
+    stored_cwd = runtime_host_value(prompt, "Current working directory")
     if stored_cwd and stored_cwd != str(resolve_agent_cwd()):
         return False
     # Platform is deliberately NOT an identity field: a surface switch does not invalidate the
@@ -1693,7 +1685,9 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
         # hedge over the whole list rather than under-report a possible side effect.
         start = result.get("current_turn_user_idx")
         turn_messages = messages[start:] if isinstance(start, int) and 0 <= start < len(messages) else messages
-        append_message(messages, {"role": "assistant", "content": failed_turn_notice(turn_messages)})
+        append_message(messages, {
+            "role": "assistant", "content": failed_turn_notice(turn_messages), "display_kind": FAILED_TURN_DISPLAY_KIND,
+        })
         agent._flush_messages_to_session_db(messages)
     except Exception:
         logger.debug("failed-turn boundary not written", exc_info=True)
