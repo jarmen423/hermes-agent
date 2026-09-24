@@ -207,6 +207,11 @@ def _plain(*keys: str) -> tuple:
 # ``"dm"`` defers to the global unauthorized_dm_behavior.
 _SHARED_KEYS: tuple = (
     ("unauthorized_dm_behavior", None, "dm"),
+    (
+        "unauthorized_interaction_behavior",
+        None,
+        lambda v: _normalize_choice(v, {"reply", "ignore"}, "reply"),
+    ),
     ("notice_delivery", None, lambda v: _normalize_choice(v, {"public", "private"}, "public")),
     *_plain("reply_prefix", "reply_in_thread", "cron_continuable_surface", "require_mention", "send_read_receipts"),
     ("allowed_chats", _TELEGRAM, None),

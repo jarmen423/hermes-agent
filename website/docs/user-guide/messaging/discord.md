@@ -936,6 +936,19 @@ If you intentionally want a shared room conversation, leave it off — just expe
 Always set `DISCORD_ALLOWED_USERS` (or `DISCORD_ALLOWED_ROLES`) to restrict who can interact with the bot. Without either, the gateway denies all users by default as a safety measure. Only authorize people you trust — authorized users have full access to the agent's capabilities, including tool use and system access.
 :::
 
+Unauthorized users are dropped silently on ordinary messages. Slash commands and buttons still send a private "You're not authorized" notice by default. To suppress those notices too:
+
+```yaml
+# ~/.hermes/config.yaml
+discord:
+  unauthorized_interaction_behavior: ignore
+```
+
+```bash
+# ~/.hermes/.env — env vars win over config.yaml
+DISCORD_UNAUTHORIZED_INTERACTION_BEHAVIOR=ignore
+```
+
 ### Role-Based Access Control
 
 For servers where access is managed by roles instead of individual user lists (moderator teams, support staff, internal tooling), use `DISCORD_ALLOWED_ROLES` — a comma-separated list of role IDs. Any member with one of those roles is authorized.

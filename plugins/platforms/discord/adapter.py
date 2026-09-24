@@ -556,6 +556,7 @@ _GATE_ENV_KEYS = (
     "DISCORD_IGNORED_CHANNELS", "DISCORD_NO_THREAD_CHANNELS", "DISCORD_FREE_RESPONSE_CHANNELS",
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOW_BOTS",
     "GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS",
+    "DISCORD_UNAUTHORIZED_INTERACTION_BEHAVIOR",
 )
 
 
@@ -4085,6 +4086,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             "guild=%s cmd=%r reason=%r",
             user_name, user_id, chan_id, guild_id, command_text, reason,
         )
+        if _silent_unauthorized_interactions():
+            return False
         try:
             await interaction.response.send_message(
                 _UNAUTHORIZED, ephemeral=True,
@@ -6160,6 +6163,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 
 
+def _silent_unauthorized_interactions() -> bool:
+    """True when unauthorized slash/button clicks must produce no Discord reply."""
+    return _scoped_gate_env("DISCORD_UNAUTHORIZED_INTERACTION_BEHAVIOR").strip().lower() == "ignore"
+
+
 def _component_check_auth(
     interaction, allowed_user_ids: Optional[set], allowed_role_ids: Optional[set],
 ) -> bool:
@@ -6256,13 +6264,25 @@ def _define_discord_view_classes() -> None:
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             return _component_check_auth(interaction, self.allowed_user_ids, self.allowed_role_ids)
 
+        async def interaction_check(self, interaction: discord.Interaction) -> bool:
+            # discord.py swallows False before item callbacks. Keep True in the
+            # default mode so existing ephemeral denials still fire.
+            if self._check_auth(interaction):
+                return True
+            return not _silent_unauthorized_interactions()
+
         async def _gate(self, interaction: discord.Interaction, *, resolved_msg: Optional[str], unauth_msg: str) -> bool:
-            """Reject (ephemerally) an already-resolved or unauthorized click; True when it may proceed."""
+            """Reject an unauthorized or already-resolved click; True when it may proceed.
+
+            Auth is checked first so a stranger never sees the already-resolved notice.
+            Silent mode skips the ephemeral entirely.
+            """
+            if not self._check_auth(interaction):
+                if not _silent_unauthorized_interactions():
+                    await interaction.response.send_message(unauth_msg, ephemeral=True)
+                return False
             if resolved_msg is not None and self.resolved:
                 await interaction.response.send_message(resolved_msg, ephemeral=True)
-                return False
-            if not self._check_auth(interaction):
-                await interaction.response.send_message(unauth_msg, ephemeral=True)
                 return False
             return True
 
@@ -6660,7 +6680,8 @@ def _define_discord_view_classes() -> None:
 
         async def _on_select(self, interaction: discord.Interaction):
             if not self._check_auth(interaction):
-                await interaction.response.send_message(_UNAUTHORIZED, ephemeral=True)
+                if not _silent_unauthorized_interactions():
+                    await interaction.response.send_message("⛔ You are not authorized to change this setting.", ephemeral=True)
                 return
             if self.resolved:
                 await interaction.response.defer()
@@ -7269,6 +7290,12 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
 
     _gate("allow_from", "DISCORD_ALLOWED_USERS", from_platform_extra=True)
     _gate("allowed_roles", "DISCORD_ALLOWED_ROLES", from_platform_extra=True)
+    _gate(
+        "unauthorized_interaction_behavior",
+        "DISCORD_UNAUTHORIZED_INTERACTION_BEHAVIOR",
+        from_platform_extra=True,
+        lower=True,
+    )
     _gate("allow_all_users", "DISCORD_ALLOW_ALL_USERS", from_platform_extra=True, lower=True)
     _gate("allow_bots", "DISCORD_ALLOW_BOTS", from_platform_extra=True, lower=True)
     approval_mentions_cfg = (
