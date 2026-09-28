@@ -1229,6 +1229,9 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
     if codex and not local:
         codex_floor = openai_codex_stale_timeout_floor(est_tokens)
         stale_timeout = _bound_openai_codex_stale_timeout(stale_timeout, est_tokens)
+        # The poll loop skips the stale kill while TTFB/idle own progress, so the #64507
+        # ceiling must travel separately to stay the absolute backstop.
+        hard_timeout = max(env_float("HERMES_CODEX_HARD_TIMEOUT_SECONDS", 1500.0), 0.0)
 
     idle_default = max(effort_floor, next(
         (default for threshold, default in ((100_000, 180.0), (50_000, 120.0), (10_000, 60.0)) if est_tokens > threshold),
