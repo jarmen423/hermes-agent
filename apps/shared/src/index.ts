@@ -60,6 +60,7 @@ export {
   DATA_URL_READ_MAX_MAX_MB,
   DATA_URL_READ_MIN_MAX_MB
 } from './data-url-read-max'
+export { type ExternalUrlTarget, externalUrlTarget } from './external-url'
 export { compactNumber } from './format'
 export { type FuzzyMatch, fuzzyRank, fuzzyScore, fuzzyScoreMulti, type RankedItem } from './fuzzy'
 export * from './gateway-events'
@@ -183,6 +184,7 @@ export {
   type GatewayWsUrlResult,
   type HermesWebSocketUrlOptions,
   isGatewayReauthRequired,
+  normalizeBasePath,
   resolveGatewayWsUrl,
   type ResolveGatewayWsUrlDeps,
   type WebSocketAuthParam
