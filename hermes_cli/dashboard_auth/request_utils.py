@@ -77,6 +77,15 @@ def cookie_origin_is_allowed(request: Request) -> bool:
     fetch_sites = request.headers.getlist("sec-fetch-site")
     if fetch_sites:
         return fetch_sites == ["same-origin"]
+    # No Fetch Metadata (older browsers, stripped headers): fall back to the
+    # Origin header itself. Accept the request's own addressed origin (direct
+    # access: the browser attests the initiator is same-origin) as well as the
+    # configured public URL (reverse-proxy access). A configured public_url must
+    # not veto direct binds: one config serves surfaces with different public
+    # origins (e.g. serve behind tailscale-serve https, webapp browsed by IP).
+    own = _http_origin(f"{request.url.scheme}://{request.url.netloc}")
+    if origin is not None and origin == own:
+        return True
     target = urlsplit(resolve_public_url() or str(request.url))
     return origin == _http_origin(f"{target.scheme}://{target.netloc}")
 
