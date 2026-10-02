@@ -14,7 +14,7 @@ import pytest
 
 from gateway.config import PlatformConfig
 from plugins.platforms.discord.adapter import (  # noqa: E402
-    _UNAUTHORIZED,
+    _unauthorized,
     ChoicePickerView,
     ClarifyChoiceView,
     DiscordAdapter,
@@ -146,6 +146,6 @@ async def test_default_mode_still_sends_slash_denial():
     interaction = _interaction()
     assert await adapter._check_slash_authorization(interaction, "/help") is False
     interaction.response.send_message.assert_awaited_once_with(
-        _UNAUTHORIZED,
+        _unauthorized(),
         ephemeral=True,
     )
