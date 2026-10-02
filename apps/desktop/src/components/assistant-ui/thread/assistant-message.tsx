@@ -1,3 +1,4 @@
+import { useActionBarReload } from '@assistant-ui/core/react'
 import {
   ActionBarPrimitive,
   BranchPickerPrimitive,
@@ -27,6 +28,7 @@ import { MESSAGE_PARTS_COMPONENTS } from '@/components/assistant-ui/thread/messa
 import { ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { ResponseMessageIds } from '@/components/assistant-ui/thread/response-group'
 import { ResponseLoadingIndicator, TurnActivityIndicator } from '@/components/assistant-ui/thread/status'
+import { threadMessageIndex } from '@/components/assistant-ui/thread/thread-message-index'
 import { MessageTimelineTimestamp } from '@/components/assistant-ui/thread/timeline-timestamp'
 import { useMessageReactions, useTapbackDoubleClick } from '@/components/assistant-ui/thread/use-message-reactions'
 import { AGENT_MESSAGE_RE } from '@/components/assistant-ui/thread/user-message'
@@ -34,6 +36,8 @@ import { isApprovalActivity, isCurrentTurnMessage } from '@/components/assistant
 import { TooltipIconButton } from '@/components/assistant-ui/tooltip-icon-button'
 import { formatElapsed } from '@/components/chat/activity-timer'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
+import { ActionsMenu, renderActionItem } from '@/components/ui/actions-menu'
+import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { CopyButton } from '@/components/ui/copy-button'
 import { useI18n } from '@/i18n'
@@ -54,6 +58,7 @@ import {
   GitForkIcon,
   KeyRound,
   Loader2Icon,
+  MoreHorizontal,
   RefreshCwIcon,
   SmilePlusIcon,
   Upload,
@@ -65,6 +70,7 @@ import { markAssistantIdSpoken } from '@/lib/spoken-reply'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { playSpeechText, stopVoicePlayback } from '@/lib/voice-playback'
+import { DESKTOP_BUTTON_ACTIONS, recordAction } from '@/store/desktop-metrics'
 import { openFreeTierSignIn } from '@/store/free-tier-sign-in'
 import { notifyError } from '@/store/notifications'
 import { startManualProviderOAuth } from '@/store/onboarding'
@@ -125,32 +131,26 @@ export const AssistantMessage: FC<AssistantMessageProps> = props => {
   const interAgentSender = useAuiState(s => {
     const messages = s.thread.messages
 
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].id !== s.message.id) {
-        continue
+    // Shared id->index map: a per-row scan for its own position was
+    // mounted-rows x transcript-length on every streamed chunk (#126486).
+    for (let j = threadMessageIndex(messages, s.message.id) - 1; j >= 0; j--) {
+      const prev = messages[j] as { content?: unknown; role?: string }
+
+      if (prev.role === 'assistant') {
+        return null
       }
 
-      for (let j = i - 1; j >= 0; j--) {
-        const prev = messages[j] as { content?: unknown; role?: string }
+      if (prev.role === 'user') {
+        const match = AGENT_MESSAGE_RE.exec(messageContentText(prev.content as never).trim())
 
-        if (prev.role === 'assistant') {
+        if (!match) {
           return null
         }
 
-        if (prev.role === 'user') {
-          const match = AGENT_MESSAGE_RE.exec(messageContentText(prev.content as never).trim())
+        const sender = (match[1] || match[3] || 'agent').trim()
 
-          if (!match) {
-            return null
-          }
-
-          const sender = (match[1] || match[3] || 'agent').trim()
-
-          return dispatchedTo(messages.slice(0, j), [match[1], match[2], match[3]]) ? null : sender
-        }
+        return dispatchedTo(messages.slice(0, j), [match[1], match[2], match[3]]) ? null : sender
       }
-
-      return null
     }
 
     return null
@@ -312,6 +312,7 @@ const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null 
           >
             {/* Todos render in the composer status stack now, not inline. */}
             {MESSAGE_PARTS}
+            <StoppedNotice />
             <AssistantStatusSlot />
             <AssistantPreviewEmbeds />
             <MessagePrimitive.Error>
@@ -363,6 +364,28 @@ const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null 
         </>
       )}
     </MessagePrimitive.Root>
+  )
+}
+
+const StoppedNotice: FC = () => {
+  const { t } = useI18n()
+
+  const stopped = useAuiState(
+    s => s.message.status?.type !== 'running' && s.message.metadata?.custom?.interrupted === true
+  )
+
+  if (!stopped) {
+    return null
+  }
+
+  return (
+    <div
+      className="flex items-center gap-1 px-(--message-text-indent) pt-1 text-[0.72rem] text-(--ui-text-tertiary)"
+      data-slot="aui_assistant-message-stopped"
+    >
+      <Codicon className="size-3" name="debug-stop" />
+      {t.assistant.thread.responseStopped}
+    </div>
   )
 }
 
@@ -619,12 +642,12 @@ const SwitchProviderAction: FC<{ label: string }> = ({ label }) => {
   )
 }
 
-// Settings → Keys deep link for a rejected API key: `?tab=keys` plus
-// `&key=<ENV>` when the descriptor names the env var (keys-settings.tsx
-// scrolls to and expands that row). Older backends omit `api_key_env`; the
-// tab alone is still the right place.
+// Settings → Providers → API keys deep link for a rejected API key, plus
+// `&key=<ENV>` when the descriptor names the env var (providers-settings.tsx
+// scrolls to and expands that provider). Older backends omit `api_key_env`;
+// the API-keys list alone is still the right place.
 const updateApiKeyRoute = (surface: ErrorSurface | undefined) => {
-  const params = new URLSearchParams({ tab: 'keys' })
+  const params = new URLSearchParams({ tab: 'providers', pview: 'keys' })
 
   if (surface?.apiKeyEnv) {
     params.set('key', surface.apiKeyEnv)
@@ -694,7 +717,8 @@ const CompressConversationAction: FC<{ label: string }> = ({ label }) => {
     }
 
     triggerHaptic('submit')
-    void delegate.executeSlash('/compress', sessionId).catch(error => {
+    // A button, not a typed command: kept out of the slash-command usage count.
+    void delegate.executeSlash('/compress', sessionId, { typed: false }).catch(error => {
       notifyError(error, t.assistant.thread.errorCompressFailed)
     })
   }, [sessionId, t.assistant.thread.errorCompressFailed])
@@ -835,26 +859,33 @@ const ErrorRecoveryActions: FC = () => {
 
   // Reveal a local folder through Electron; `logsRoot` is the profile's
   // HERMES_HOME/logs, and its parent is the Hermes data folder itself (what
-  // the user needs to see to free space after a disk-full failure).
-  const openLocalDir = useCallback(async (resolve: (logsRoot: string) => string, failedMessage: string) => {
-    try {
-      const root = await window.hermesDesktop?.logsRoot?.()
+  // the user needs to see to free space after a disk-full failure). Resolved
+  // for the profile that OWNS this session (a tile / Bot chat names it in its
+  // composer scope), not the pooled backend's launch profile (#119080).
+  const ownerProfile = useComposerScope().profile || gatewayProfile
 
-      if (!root) {
-        notifyError(new Error('logs root unavailable'), failedMessage)
+  const openLocalDir = useCallback(
+    async (resolve: (logsRoot: string) => string, failedMessage: string) => {
+      try {
+        const root = await window.hermesDesktop?.logsRoot?.(normalizeProfileKey(ownerProfile))
 
-        return
+        if (!root) {
+          notifyError(new Error('logs root unavailable'), failedMessage)
+
+          return
+        }
+
+        const result = await window.hermesDesktop?.openDir?.(resolve(root))
+
+        if (result && !result.ok) {
+          notifyError(new Error(result.error || 'open failed'), failedMessage)
+        }
+      } catch (error) {
+        notifyError(error, failedMessage)
       }
-
-      const result = await window.hermesDesktop?.openDir?.(resolve(root))
-
-      if (result && !result.ok) {
-        notifyError(new Error(result.error || 'open failed'), failedMessage)
-      }
-    } catch (error) {
-      notifyError(error, failedMessage)
-    }
-  }, [])
+    },
+    [ownerProfile]
+  )
 
   const openLogs = useCallback(
     () => openLocalDir(root => root, copy.errorOpenLogsFailed),
@@ -931,7 +962,14 @@ const ErrorRecoveryActions: FC = () => {
       )}
       {plan.retry && (
         <ActionBarPrimitive.Reload asChild>
-          <button className="aui-error-action" onClick={() => triggerHaptic('submit')} type="button">
+          <button
+            className="aui-error-action"
+            onClick={() => {
+              triggerHaptic('submit')
+              recordAction(DESKTOP_BUTTON_ACTIONS.messageRetry, 'click')
+            }}
+            type="button"
+          >
             <RefreshCwIcon className="size-3" />
             {copy.errorRetry}
           </button>
@@ -963,6 +1001,85 @@ const ErrorRecoveryActions: FC = () => {
   )
 }
 
+interface ReadAloudActionState {
+  disabled: boolean
+  isPreparing: boolean
+  isSpeaking: boolean
+  menuLabel: string
+  onActivate: (event?: { shiftKey?: boolean }) => void
+  tooltip: string
+}
+
+function useReadAloudAction({
+  fullResponseAvailable,
+  getFullText,
+  getText,
+  messageId
+}: {
+  fullResponseAvailable: boolean
+  getFullText: () => string
+  getText: () => string
+  messageId: string
+}): ReadAloudActionState {
+  const { t } = useI18n()
+  const copy = t.assistant.thread
+  const voicePlayback = useStore($voicePlayback)
+  const view = useSessionView()
+  const sessionId = useStore(view.$runtimeId)
+  // A Bot chat's session owns its own (connection, profile) → its own TTS voice.
+  const { connectionId, profile } = useComposerScope()
+
+  const readAloudStatus =
+    voicePlayback.source === 'read-aloud' && voicePlayback.messageId === messageId ? voicePlayback.status : 'idle'
+
+  const isPreparing = readAloudStatus === 'preparing'
+  const isSpeaking = readAloudStatus === 'speaking'
+  const anyPlaybackActive = voicePlayback.status !== 'idle'
+
+  // Default reads the current reply only; Shift-click reads the whole response
+  // group — the read-aloud mirror of the two copy scopes (#118864).
+  const read = useCallback(
+    async (full: boolean) => {
+      const text = full ? getFullText() : getText()
+
+      if (!text || $voicePlayback.get().status !== 'idle') {
+        return
+      }
+
+      try {
+        await playSpeechText(text, { connectionId, messageId, profile, source: 'read-aloud' })
+        markAssistantIdSpoken(sessionId, view.$messages.get(), messageId)
+      } catch (error) {
+        notifyError(error, copy.readAloudFailed)
+      }
+    },
+    [connectionId, copy.readAloudFailed, getFullText, getText, messageId, profile, sessionId, view.$messages]
+  )
+
+  const onActivate = useCallback(
+    (event?: { shiftKey?: boolean }) => {
+      triggerHaptic('selection')
+      void (isSpeaking ? stopVoicePlayback() : read(Boolean(event?.shiftKey)))
+    },
+    [isSpeaking, read]
+  )
+
+  return {
+    disabled: isPreparing || (!isSpeaking && anyPlaybackActive),
+    isPreparing,
+    isSpeaking,
+    menuLabel: isSpeaking ? copy.stopReading : copy.readAloud,
+    onActivate,
+    tooltip: isPreparing
+      ? copy.preparingAudio
+      : isSpeaking
+        ? copy.stopReading
+        : fullResponseAvailable
+          ? `${copy.readAloud} (${copy.readAloudFullResponseHint})`
+          : copy.readAloud
+  }
+}
+
 const AssistantActionBar: FC<MessageActionProps & { durationS?: number }> = ({
   durationS,
   fullResponseAvailable,
@@ -973,9 +1090,27 @@ const AssistantActionBar: FC<MessageActionProps & { durationS?: number }> = ({
 }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
+  const { reload: reloadMessage, disabled: reloadDisabled } = useActionBarReload()
 
   const [pickerOpen, setPickerOpen] = useState(false)
   const { enabled: reactionsEnabled, react, reactions: shownReactions } = useMessageReactions(messageId, 'assistant')
+
+  const readAloud = useReadAloudAction({
+    fullResponseAvailable,
+    getFullText: getFullResponseText,
+    getText: getMessageText,
+    messageId
+  })
+
+  const reload = useCallback(() => {
+    if (reloadDisabled) {
+      return
+    }
+
+    triggerHaptic('submit')
+    recordAction(DESKTOP_BUTTON_ACTIONS.messageRetry, 'click')
+    reloadMessage()
+  }, [reloadDisabled, reloadMessage])
 
   const pickEmoji = useCallback(
     (emoji: null | string) => {
@@ -1009,32 +1144,93 @@ const AssistantActionBar: FC<MessageActionProps & { durationS?: number }> = ({
         }
         data-slot="aui_msg-actions"
       >
-        {onBranchInNewChat && (
-          <TooltipIconButton
-            onClick={() => {
-              triggerHaptic('selection')
-              onBranchInNewChat(messageId)
-            }}
-            tooltip={copy.branchNewChat}
-          >
-            <GitForkIcon className="size-3.5" />
-          </TooltipIconButton>
-        )}
-        <CopyButton appearance="icon" buttonSize="icon" label={copy.copy} text={getMessageText} />
-        {fullResponseAvailable && (
-          <CopyButton appearance="icon" buttonSize="icon" label={copy.copyFullResponse} text={getFullResponseText} />
-        )}
-        <ReadAloudButton
-          fullResponseAvailable={fullResponseAvailable}
-          getFullText={getFullResponseText}
-          getText={getMessageText}
-          messageId={messageId}
-        />
-        <ActionBarPrimitive.Reload asChild>
-          <TooltipIconButton onClick={() => triggerHaptic('submit')} tooltip={copy.refresh}>
+        <div className="aui-message-actions-desktop flex items-center justify-end gap-1.5">
+          {onBranchInNewChat && (
+            <TooltipIconButton
+              onClick={() => {
+                triggerHaptic('selection')
+                onBranchInNewChat(messageId)
+              }}
+              tooltip={copy.branchNewChat}
+            >
+              <GitForkIcon className="size-3.5" />
+            </TooltipIconButton>
+          )}
+          <CopyButton
+            appearance="icon"
+            buttonSize="icon"
+            label={copy.copy}
+            onCopied={() => recordAction(DESKTOP_BUTTON_ACTIONS.messageCopy, 'click')}
+            text={getMessageText}
+          />
+          {fullResponseAvailable && (
+            <CopyButton appearance="icon" buttonSize="icon" label={copy.copyFullResponse} text={getFullResponseText} />
+          )}
+          <ReadAloudButton action={readAloud} />
+          <TooltipIconButton disabled={reloadDisabled} onClick={reload} tooltip={copy.refresh}>
             <RefreshCwIcon className="size-3.5" />
           </TooltipIconButton>
-        </ActionBarPrimitive.Reload>
+        </div>
+        <div
+          className="aui-message-actions-touch items-center justify-end gap-1"
+          data-testid="aui-touch-message-actions"
+        >
+          <CopyButton
+            appearance="icon"
+            buttonSize="icon"
+            label={copy.copy}
+            onCopied={() => recordAction(DESKTOP_BUTTON_ACTIONS.messageCopy, 'click')}
+            text={getMessageText}
+          />
+          <ActionsMenu
+            ariaLabel={copy.moreActions}
+            items={kit => (
+              <>
+                {onBranchInNewChat &&
+                  renderActionItem(kit, {
+                    icon: 'git-branch',
+                    key: 'branch',
+                    label: copy.branchNewChat,
+                    onSelect: () => {
+                      triggerHaptic('selection')
+                      onBranchInNewChat(messageId)
+                    }
+                  })}
+                {fullResponseAvailable && (
+                  <CopyButton
+                    appearance={kit.copyAppearance}
+                    label={copy.copyFullResponse}
+                    text={getFullResponseText}
+                  />
+                )}
+                {renderActionItem(kit, {
+                  iconNode: <AudioLines className="size-3.5" />,
+                  key: 'read-aloud',
+                  label: readAloud.menuLabel,
+                  onSelect: () => readAloud.onActivate(),
+                  disabled: readAloud.disabled
+                })}
+                {renderActionItem(kit, {
+                  iconNode: <RefreshCwIcon className="size-3.5" />,
+                  key: 'refresh',
+                  label: copy.refresh,
+                  disabled: reloadDisabled,
+                  onSelect: reload
+                })}
+              </>
+            )}
+          >
+            <Button
+              aria-label={copy.moreActions}
+              data-testid="aui-touch-more-actions"
+              size="icon"
+              type="button"
+              variant="ghost"
+            >
+              <MoreHorizontal className="size-3.5" />
+            </Button>
+          </ActionsMenu>
+        </div>
       </ActionBarPrimitive.Root>
       {/* ONE slot, Slack-style: the picker trigger and the landed reaction are
           the same element, so reacting never shifts layout. Empty → ☺, hidden
@@ -1076,66 +1272,12 @@ const AssistantActionBar: FC<MessageActionProps & { durationS?: number }> = ({
   )
 }
 
-const ReadAloudButton: FC<{
-  fullResponseAvailable: boolean
-  getFullText: () => string
-  getText: () => string
-  messageId: string
-}> = ({ fullResponseAvailable, getFullText, getText, messageId }) => {
-  const { t } = useI18n()
-  const copy = t.assistant.thread
-  const voicePlayback = useStore($voicePlayback)
-  const view = useSessionView()
-  const sessionId = useStore(view.$runtimeId)
-  // A Bot chat's session owns its own (connection, profile) → its own TTS voice.
-  const { connectionId, profile } = useComposerScope()
-
-  const readAloudStatus =
-    voicePlayback.source === 'read-aloud' && voicePlayback.messageId === messageId ? voicePlayback.status : 'idle'
-
-  const isPreparing = readAloudStatus === 'preparing'
-  const isSpeaking = readAloudStatus === 'speaking'
-  const anyPlaybackActive = voicePlayback.status !== 'idle'
-  const Icon = isPreparing ? Loader2Icon : isSpeaking ? VolumeXIcon : AudioLines
-
-  const tooltip = isPreparing
-    ? copy.preparingAudio
-    : isSpeaking
-      ? copy.stopReading
-      : fullResponseAvailable
-        ? `${copy.readAloud} (${copy.readAloudFullResponseHint})`
-        : copy.readAloud
-
-  // Default reads the current reply only; Shift-click reads the whole response
-  // group — the read-aloud mirror of the two copy scopes (#118864).
-  const read = useCallback(
-    async (full: boolean) => {
-      const text = full ? getFullText() : getText()
-
-      if (!text || $voicePlayback.get().status !== 'idle') {
-        return
-      }
-
-      try {
-        await playSpeechText(text, { connectionId, messageId, profile, source: 'read-aloud' })
-        markAssistantIdSpoken(sessionId, view.$messages.get(), messageId)
-      } catch (error) {
-        notifyError(error, copy.readAloudFailed)
-      }
-    },
-    [connectionId, copy.readAloudFailed, getFullText, getText, messageId, profile, sessionId, view.$messages]
-  )
+const ReadAloudButton: FC<{ action: ReadAloudActionState }> = ({ action }) => {
+  const Icon = action.isPreparing ? Loader2Icon : action.isSpeaking ? VolumeXIcon : AudioLines
 
   return (
-    <TooltipIconButton
-      disabled={isPreparing || (!isSpeaking && anyPlaybackActive)}
-      onClick={event => {
-        triggerHaptic('selection')
-        void (isSpeaking ? stopVoicePlayback() : read(event.shiftKey))
-      }}
-      tooltip={tooltip}
-    >
-      <Icon className={cn('size-3.5', isPreparing && 'animate-spin')} />
+    <TooltipIconButton disabled={action.disabled} onClick={action.onActivate} tooltip={action.tooltip}>
+      <Icon className={cn('size-3.5', action.isPreparing && 'animate-spin')} />
     </TooltipIconButton>
   )
 }

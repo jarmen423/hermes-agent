@@ -10,17 +10,21 @@ import {
 } from '@/components/assistant-ui/thread/content'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { BackgroundResult } from '@/components/assistant-ui/thread/system-message'
+import { threadUserOrdinal } from '@/components/assistant-ui/thread/thread-message-index'
 import { MessageTimelineTimestamp } from '@/components/assistant-ui/thread/timeline-timestamp'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
 import { useMessageReactions } from '@/components/assistant-ui/thread/use-message-reactions'
 import { UserMessageText } from '@/components/assistant-ui/thread/user-message-text'
+import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
+import { useMediaQuery } from '@/hooks/use-media-query'
 import { useResizeObserver } from '@/hooks/use-resize-observer'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { StopFilled } from '@/lib/icons'
 import { LruCache } from '@/lib/lru-cache'
+import { TOUCH_POINTER_QUERY } from '@/lib/touch-interaction'
 import { cn } from '@/lib/utils'
 import { $gateway } from '@/store/gateway'
 import { notifyThreadEditOpen } from '@/store/thread-scroll'
@@ -31,6 +35,17 @@ export function hasTextSelection(): boolean {
   const selection = window.getSelection()
 
   return Boolean(selection && !selection.isCollapsed && selection.toString().length > 0)
+}
+
+/** Keep the platform's long-press menu on touch surfaces. Desktop right-click
+ * remains the intentional reaction-picker gesture, while iOS/Android own
+ * selection handles, Copy, and text actions after a long press. */
+export function preservesNativeTouchContextMenu(): boolean {
+  return Boolean(
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(hover: none), (pointer: coarse)').matches
+  )
 }
 
 export function StickyHumanMessageContainer({
@@ -246,6 +261,7 @@ export const UserMessage: FC<{
 }> = ({ onCancel, onRequestRestoreConfirm }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
+  const touch = useMediaQuery(TOUCH_POINTER_QUERY)
   const messageId = useAuiState(s => s.message.id)
   const content = useAuiState(s => s.message.content)
   const messageText = messageContentText(content)
@@ -263,23 +279,7 @@ export const UserMessage: FC<{
     return null
   })
 
-  const runtimeUserOrdinal = useAuiState(s => {
-    let ordinal = 0
-
-    for (const message of s.thread.messages) {
-      if (message.role !== 'user') {
-        continue
-      }
-
-      if (message.id === s.message.id) {
-        return ordinal
-      }
-
-      ordinal += 1
-    }
-
-    return null
-  })
+  const runtimeUserOrdinal = useAuiState(s => threadUserOrdinal(s.thread.messages, s.message.id))
 
   const attachmentRefs = useAuiState(s => {
     const custom = (s.message.metadata?.custom ?? {}) as { attachmentRefs?: unknown }
@@ -313,7 +313,7 @@ export const UserMessage: FC<{
   // toggles the 2-line clamp so long prompts are still fully readable.
   const readOnly = isWatchWindow()
   const [expanded, setExpanded] = useState(false)
-  const clampActive = !(readOnly && expanded)
+  const clampActive = !touch && !(readOnly && expanded)
 
   const measureClamp = useCallback((entries: readonly ResizeObserverEntry[]) => {
     const inner = clampInnerRef.current
@@ -450,13 +450,13 @@ export const UserMessage: FC<{
                 // menu, and this handler's selection guard keeps ⌘C flows.
                 data-context-menu-skip=""
                 onContextMenu={
-                  // Right-click is the desktop stand-in for iOS touch-and-hold —
-                  // but only when there's nothing selected. A live highlight
-                  // keeps the native Copy menu (and ⌘C) instead of the picker.
+                  // Right-click is the desktop reaction gesture. Touch surfaces
+                  // leave long-press entirely to the platform so selection
+                  // handles and Copy are never replaced by the picker.
                   readOnly || !reactionsEnabled
                     ? undefined
                     : event => {
-                        if (hasTextSelection()) {
+                        if (hasTextSelection() || preservesNativeTouchContextMenu()) {
                           return
                         }
 
@@ -465,7 +465,28 @@ export const UserMessage: FC<{
                       }
                 }
               >
-                {readOnly ? (
+                {touch ? (
+                  <>
+                    <div className={cn(bubbleClassName, 'cursor-text')} data-selectable-text="true">
+                      {bubbleContent}
+                    </div>
+                    <div className={cn('flex justify-end', (showStop || showRestore) && 'pr-11')}>
+                      {!readOnly && (
+                        <ActionBarPrimitive.Edit asChild>
+                          <Button
+                            aria-label={copy.editMessage}
+                            data-slot="aui_user-touch-edit"
+                            onClick={notifyThreadEditOpen}
+                            size="icon"
+                            variant="ghost"
+                          >
+                            <Codicon name="edit" />
+                          </Button>
+                        </ActionBarPrimitive.Edit>
+                      )}
+                    </div>
+                  </>
+                ) : readOnly ? (
                   // Spectator transcript: clicking only toggles the clamp so the
                   // full prompt is readable — never opens an edit composer.
                   <button
@@ -518,11 +539,22 @@ export const UserMessage: FC<{
                   </ActionBarPrimitive.Edit>
                 )}
                 {(showStop || showRestore) && (
-                  <div className="pointer-events-none absolute right-2 bottom-2 z-10 flex items-center justify-center opacity-0 transition-opacity group-hover/user-message:opacity-100 group-focus-within/user-message:opacity-100">
+                  <div
+                    className={cn(
+                      'pointer-events-none absolute right-2 bottom-2 z-10 flex items-center justify-center transition-opacity',
+                      touch
+                        ? 'opacity-100'
+                        : 'opacity-0 group-hover/user-message:opacity-100 group-focus-within/user-message:opacity-100'
+                    )}
+                  >
                     {showStop ? (
                       <button
                         aria-label={copy.stop}
-                        className={cn('pointer-events-auto size-5', USER_ACTION_ICON_BUTTON_CLASS)}
+                        className={cn(
+                          'pointer-events-auto',
+                          touch ? 'size-11' : 'size-5',
+                          USER_ACTION_ICON_BUTTON_CLASS
+                        )}
                         onClick={event => {
                           event.preventDefault()
                           event.stopPropagation()
@@ -536,7 +568,11 @@ export const UserMessage: FC<{
                       <Tip label={copy.restoreFromHere}>
                         <button
                           aria-label={copy.restoreCheckpoint}
-                          className={cn('pointer-events-auto size-6', USER_ACTION_ICON_BUTTON_CLASS)}
+                          className={cn(
+                            'pointer-events-auto',
+                            touch ? 'size-11' : 'size-6',
+                            USER_ACTION_ICON_BUTTON_CLASS
+                          )}
                           onClick={event => {
                             event.preventDefault()
                             event.stopPropagation()

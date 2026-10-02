@@ -13,7 +13,7 @@ import { isElementInHiddenPane } from '@/components/pane-shell/pane-visibility'
 import { Button } from '@/components/ui/button'
 import { Tip } from '@/components/ui/tooltip'
 import { type Translations, useI18n } from '@/i18n'
-import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
+import { isDesktopFsRemoteMode, isReadFileErrorResult } from '@/lib/desktop-fs'
 import { guardGuestPointers } from '@/lib/guest-pointer-guard'
 import { ExternalLink } from '@/lib/icons'
 import { isLoopbackPreviewUrl, openPreviewTargetInBrowser, remoteHtmlPreviewDocument } from '@/lib/local-preview'
@@ -29,6 +29,7 @@ import {
   endAnnotateMode,
   flushAnnotateStack
 } from '@/lib/preview-annotate'
+import { handoffPreviewAnnotateStack } from '@/lib/preview-annotate/handoff'
 import { admitPreviewExternalUrl, PREVIEW_EXTERNAL_CHANNEL } from '@/lib/preview-external'
 import { reachablePreviewUrl } from '@/lib/preview-reach'
 import { rafCoalesce } from '@/lib/raf-coalesce'
@@ -73,32 +74,34 @@ import {
 import { type ConsoleEntry } from './preview-console-state'
 import { previewConsoleState } from './preview-console-store'
 import { LocalFilePreview, PreviewEmptyState, PreviewModeSwitcher } from './preview-file'
+import { usePreviewGuestOffscreen } from './preview-guest-offscreen'
 import { type PreviewInputEvent, registerPreviewInput, toWebviewInputSpace } from './preview-input'
 import { PREVIEW_BROWSER_ATTR, registerPreviewNav } from './preview-nav'
 import { registerPreviewPageReader } from './preview-reader'
 import { registerPreviewScriptRunner } from './preview-script-runner'
 import { RealProfileConsentDialog } from './real-profile-consent-dialog'
 
-type PreviewWebview = HTMLElement & PreviewNavigationSurface & {
-  canGoBack?: () => boolean
-  canGoForward?: () => boolean
-  closeDevTools?: () => void
-  copy?: () => void
-  cut?: () => void
-  executeJavaScript?: (code: string) => Promise<unknown>
-  getWebContentsId?: () => number
-  goBack?: () => void
-  goForward?: () => void
-  inspectElement?: (x: number, y: number) => void
-  isDevToolsOpened?: () => boolean
-  openDevTools?: () => void
-  paste?: () => void
-  reloadIgnoringCache?: () => void
-  replaceMisspelling?: (word: string) => void
-  selectAll?: () => void
-  sendInputEvent?: (event: PreviewInputEvent) => void
-  getZoomFactor?: () => number
-}
+type PreviewWebview = HTMLElement &
+  PreviewNavigationSurface & {
+    canGoBack?: () => boolean
+    canGoForward?: () => boolean
+    closeDevTools?: () => void
+    copy?: () => void
+    cut?: () => void
+    executeJavaScript?: (code: string) => Promise<unknown>
+    getWebContentsId?: () => number
+    goBack?: () => void
+    goForward?: () => void
+    inspectElement?: (x: number, y: number) => void
+    isDevToolsOpened?: () => boolean
+    openDevTools?: () => void
+    paste?: () => void
+    reloadIgnoringCache?: () => void
+    replaceMisspelling?: (word: string) => void
+    selectAll?: () => void
+    sendInputEvent?: (event: PreviewInputEvent) => void
+    getZoomFactor?: () => number
+  }
 
 /** Electron throws if getURL/getTitle run before attach + dom-ready, or after
  *  the guest has been removed. Optional chaining does not help — the method
@@ -278,6 +281,7 @@ export function PreviewPane({
   const navigationRef = useRef<PreviewNavigationSurface | null>(null)
   const previewContentRef = useRef<HTMLDivElement | null>(null)
   const webviewRef = useRef<PreviewWebview | null>(null)
+  const noteGuestReady = usePreviewGuestOffscreen(webviewRef, tabId)
   const previewServerRestart = useStore($previewServerRestart)
   const consoleHeight = useStore(consoleState.$height)
   const consoleOpen = useStore(consoleState.$open)
@@ -285,6 +289,11 @@ export function PreviewPane({
   const [currentUrl, setCurrentUrl] = useState(target.url)
   const liveUrlRef = useRef(currentUrl)
   liveUrlRef.current = currentUrl
+  // The guest-creation effect below deliberately omits target.url from its
+  // deps (it reuses the guest across navigations — see #120265), so it reads
+  // the live address through this mirror instead of a stale closure.
+  const targetUrlRef = useRef(target.url)
+  targetUrlRef.current = target.url
   const [devtoolsOpen, setDevtoolsOpen] = useState(false)
   const [history, setHistory] = useState({ back: false, forward: false })
   const [loading, setLoading] = useState(true)
@@ -558,17 +567,34 @@ export function PreviewPane({
 
     const guest = annotateGuest()
 
-    await flushAnnotateStack(
-      pins,
-      {
-        attachImage: blob => {
-          requestComposerAttachImages([blob])
+    if (isBrowserWindow()) {
+      const result = tabId
+        ? await handoffPreviewAnnotateStack(tabId, pins, currentUrl)
+        : { error: 'This Browser window has no tab identity.', ok: false }
+
+      if (!result.ok) {
+        notify({
+          kind: 'warning',
+          message: result.error || 'Could not add Browser comments to the original chat.',
+          title: copy.annotate
+        })
+
+        return
+      }
+    } else {
+      await flushAnnotateStack(
+        pins,
+        {
+          attachImage: blob => {
+            requestComposerAttachImages([blob])
+          },
+          insertText: text => requestComposerInsert(text, { mode: 'block' })
         },
-        insertText: text => requestComposerInsert(text, { mode: 'block' })
-      },
-      currentUrl
-    )
-    requestComposerFocus()
+        currentUrl
+      )
+      requestComposerFocus()
+    }
+
     setAnnotate(session => ({ ...session, draft: null, stack: clearAnnotatePins(session.stack) }))
     setDraftNote('')
 
@@ -576,7 +602,7 @@ export function PreviewPane({
       await hideAnnotateDraft(guest).catch(() => undefined)
       await syncAnnotatePins(guest, []).catch(() => undefined)
     }
-  }, [annotateGuest, currentUrl])
+  }, [annotateGuest, copy.annotate, currentUrl, tabId])
 
   const startAnnotate = useCallback(async () => {
     const guest = annotateGuest()
@@ -773,6 +799,36 @@ export function PreviewPane({
     if (webview?.canGoForward?.()) {
       webview.goForward?.()
     }
+  }, [])
+
+  // Escape is the universal "leave where I am" key, and a preview webview that
+  // navigated away from the original page (a report's in-page links) is a
+  // dead end without it. Only the pane that holds DOM focus backs up, so two
+  // side-by-side panes never fight, and only when the webview actually has
+  // history — a remote-HTML report (data: document, no webview) or a
+  // first-page preview claims no back at all. While focus sits in an editable
+  // surface inside the pane (the browser bar's address input, an annotate
+  // note), Escape keeps its native meaning for that control and does not
+  // also navigate.
+  const onPaneKeyDown = useCallback((event: React.KeyboardEvent<HTMLElement>) => {
+    if (event.key !== 'Escape') {
+      return
+    }
+
+    const target = event.target as HTMLElement | null
+
+    if (target?.closest?.('input, textarea, [contenteditable="true"], [contenteditable=""]')) {
+      return
+    }
+
+    const webview = webviewRef.current
+
+    if (!webview?.canGoBack?.()) {
+      return
+    }
+
+    event.preventDefault()
+    webview.goBack?.()
   }, [])
 
   // Gestures that land on the app's chrome (⌘R from the address bar, a mouse
@@ -1021,6 +1077,13 @@ export function PreviewPane({
     void window.hermesDesktop
       .watchPreviewFile(target.url)
       .then(watch => {
+        // The file was already gone when the watch was requested (a restored
+        // tab probing a deleted path): structured data, not a rejection. The
+        // read below surfaces the tombstone; nothing to watch.
+        if (isReadFileErrorResult(watch)) {
+          return
+        }
+
         if (!active) {
           void window.hermesDesktop?.stopPreviewFileWatch?.(watch.id)
 
@@ -1050,6 +1113,11 @@ export function PreviewPane({
     }
   }, [appendConsoleEntry, copy, reloadPreview, target.kind, target.url])
 
+  // The guest is created ONCE per preview kind and reused across URL changes
+  // within the session (#120265): an external target.url change steers the
+  // live guest with loadURL() in the sync effect below, instead of destroying
+  // the webview and rebuilding it (which dropped JS state, cookies, form
+  // data, scroll, refs, and detached the console/annotate channels).
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     const host = hostRef.current
@@ -1058,10 +1126,11 @@ export function PreviewPane({
       return
     }
 
+    const initialUrl = targetUrlRef.current
     host.replaceChildren()
     navigationRef.current = null
     webviewRef.current = null
-    setCurrentUrl(target.url)
+    setCurrentUrl(initialUrl)
     setDevtoolsOpen(false)
     setHistory({ back: false, forward: false })
     setLoadError(null)
@@ -1081,14 +1150,14 @@ export function PreviewPane({
         onError: url => setLoadError({ description: copy.unreachableDescription, url }),
         setCurrentUrl,
         setLoading,
-        url: target.url
+        url: initialUrl
       })
     }
 
     const webview = document.createElement('webview') as PreviewWebview
     webview.className = 'flex h-full w-full flex-1 bg-transparent'
     webview.setAttribute('partition', 'persist:hermes-preview')
-    webview.setAttribute('src', target.url)
+    webview.setAttribute('src', initialUrl)
     webview.setAttribute('webpreferences', 'contextIsolation=yes,nodeIntegration=no,sandbox=yes')
 
     // The guest preload (main.ts installs it on this partition) forwards a
@@ -1130,7 +1199,7 @@ export function PreviewPane({
       if ((detail.level ?? 0) >= 3 && isModuleMimeError(message)) {
         setLoadError({
           description: copy.moduleMimeDescription,
-          url: guestPage(webview, target.url).url
+          url: guestPage(webview, liveUrlRef.current).url
         })
         setLoading(false)
       }
@@ -1153,7 +1222,7 @@ export function PreviewPane({
         return
       }
 
-      noteBrowserPage(tabId, guestPage(webview, target.url))
+      noteBrowserPage(tabId, guestPage(webview, liveUrlRef.current))
     }
 
     const onNavigate = (event: Event) => {
@@ -1193,7 +1262,7 @@ export function PreviewPane({
       setLoadError({
         code: errorCode,
         description: detail.errorDescription || copy.unreachableDescription,
-        url: detail.validatedURL || guestPage(webview, target.url).url
+        url: detail.validatedURL || guestPage(webview, liveUrlRef.current).url
       })
       setLoading(false)
     }
@@ -1313,12 +1382,14 @@ export function PreviewPane({
     webview.addEventListener('page-title-updated', notePage)
     // #101880: never let a guest reach the native print panel.
     webview.addEventListener('dom-ready', armPrintGuard)
+    webview.addEventListener('dom-ready', noteGuestReady)
     host.appendChild(webview)
     navigationRef.current = webview
     webviewRef.current = webview
 
     return () => {
       annotateLoopRef.current += 1
+
       if (navigationRef.current === webview) {
         navigationRef.current = null
       }
@@ -1326,6 +1397,7 @@ export function PreviewPane({
       if (webviewRef.current === webview) {
         webviewRef.current = null
       }
+
       webview.removeEventListener('console-message', onConsole)
       webview.removeEventListener('ipc-message', onGuestExternal)
       webview.removeEventListener('context-menu', onGuestContextMenu)
@@ -1338,26 +1410,65 @@ export function PreviewPane({
       webview.removeEventListener('did-stop-loading', onStop)
       webview.removeEventListener('page-title-updated', notePage)
       webview.removeEventListener('dom-ready', armPrintGuard)
+      webview.removeEventListener('dom-ready', noteGuestReady)
       webview.remove()
       setAnnotate(session => (session.mode ? { ...endAnnotateMode(session), stack: emptyAnnotateStack() } : session))
     }
-  }, [
-    appendConsoleEntry,
-    consoleState,
-    copy,
-    isRemoteHtml,
-    isWebPreview,
-    tabId,
-    target.kind,
-    target.url,
-    usesBrowserIframe
-  ])
+  }, [appendConsoleEntry, consoleState, copy, isRemoteHtml, isWebPreview, noteGuestReady, tabId, target.kind, usesBrowserIframe])
+
+  // Steers the LIVE guest when the session opens a new URL (#120265): loadURL
+  // keeps the webview instance (JS state, cookies, form data, scroll, refs,
+  // console/annotate channels) where the effect above used to destroy and
+  // rebuild it. Per-page state (annotate pins, console log, history) resets
+  // around the load so nothing bleeds across pages. Skipped when the guest
+  // already shows the address (an in-page navigation got there first).
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
+  useEffect(() => {
+    if (!isWebPreview || isRemoteHtml) {
+      return
+    }
+
+    const navigation = navigationRef.current
+
+    if (!navigation?.loadURL) {
+      return
+    }
+
+    const nextUrl = targetUrlRef.current
+
+    if (liveUrlRef.current === nextUrl) {
+      return
+    }
+
+    annotateLoopRef.current += 1
+    const guest = annotateGuest()
+
+    if (guest) {
+      void teardownAnnotateOverlay(guest).catch(() => undefined)
+    }
+
+    setDraftNote('')
+    setAnnotate(emptyAnnotateSession())
+    setLoadError(null)
+    consoleState.reset()
+    setHistory({ back: false, forward: false })
+    setLoading(true)
+    setCurrentUrl(nextUrl)
+    void navigation.loadURL?.(nextUrl)?.catch((error: unknown) => {
+      setLoadError({
+        description: error instanceof Error ? error.message : copy.unreachableDescription,
+        url: nextUrl
+      })
+      setLoading(false)
+    })
+  }, [annotateGuest, consoleState, copy.unreachableDescription, isRemoteHtml, isWebPreview, target.url])
 
   return (
     <aside
       className="relative flex h-full w-full min-w-0 flex-col overflow-hidden bg-transparent text-muted-foreground"
-      // Buttons 3/4 are a mouse's back/forward. Chromium delivers them to the
-      // renderer as a normal mouse event inside the app's own chrome (the
+      onKeyDown={onPaneKeyDown}
+      // Buttons 3/4 are a mouse's back/forward. Chromium delivers them to
+      // the renderer as a normal mouse event inside the app's own chrome (the
       // guest page gets its own via `app-command` in main), and unhandled they
       // walk the HOST document's history.
       onMouseDown={event => {
@@ -1438,6 +1549,7 @@ export function PreviewPane({
             devToolsOpen={devtoolsOpen}
             loading={loading}
             onBack={goBack}
+            onClose={onClose}
             onFlushComments={() => void flushComments()}
             onForward={goForward}
             onNavigate={navigateTo}

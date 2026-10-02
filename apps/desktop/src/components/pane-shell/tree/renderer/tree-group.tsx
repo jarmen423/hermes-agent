@@ -12,7 +12,9 @@
 import { useStore } from '@nanostores/react'
 import { type CSSProperties, Fragment, type ReactNode, type RefObject, useEffect, useRef, useState } from 'react'
 
+import { ShellMenuItems } from '@/app/context-menu/shell-menu-items'
 import { TITLEBAR_DRAG_HANDLE_WIDTH, TITLEBAR_HEIGHT } from '@/app/shell/titlebar'
+import { useTouchTitlebar } from '@/app/shell/use-touch-titlebar'
 import { ActionsContextMenu, type MenuKit, renderActionItem } from '@/components/ui/actions-menu'
 import { Codicon } from '@/components/ui/codicon'
 import { DecodeText } from '@/components/ui/decode-text'
@@ -99,6 +101,7 @@ import { paneChrome } from './track-model'
 function ZoneMenu({
   children,
   closable,
+  includeAppActions = false,
   minimizable = true,
   minimizeLabel,
   minimized,
@@ -108,6 +111,7 @@ function ZoneMenu({
   targetPane
 }: {
   children: ReactNode
+  includeAppActions?: boolean
   /** The pane the menu closes (the right-clicked chip / the active pane);
    *  undefined = not closable (the main zone). */
   closable?: () => string | undefined
@@ -212,6 +216,12 @@ function ZoneMenu({
             label: minimized ? t.zones.restore : (minimizeLabel ?? t.zones.minimize),
             onSelect: () => setTreeGroupMinimized(nodeId, !minimized)
           })}
+        {includeAppActions && (
+          <>
+            <kit.Separator />
+            <ShellMenuItems kit={kit} primaryOnly />
+          </>
+        )}
       </>
     )
   }
@@ -238,6 +248,7 @@ export function TreeGroup({
 }) {
   const { t } = useI18n()
   const ref = useRef<HTMLDivElement>(null)
+  const titlebarHeight = useTouchTitlebar() ? 44 : TITLEBAR_HEIGHT
   const stripRef = useRef<HTMLDivElement>(null)
   // The scrolling tab list inside the header (the strip also holds the
   // minimize chevron, which must not scroll away).
@@ -486,7 +497,7 @@ export function TreeGroup({
         wcOverlap
           ? { paddingTop: wcOverlap.y + wcOverlap.height }
           : topEdge && verticalCollapse
-            ? { paddingTop: TITLEBAR_HEIGHT }
+            ? { paddingTop: titlebarHeight }
             : undefined
       }
     >
@@ -550,7 +561,7 @@ export function TreeGroup({
         <div
           className="relative flex min-w-0 shrink-0 bg-(--ui-sidebar-surface-background)"
           data-panel-header=""
-          style={topEdge ? { height: TITLEBAR_HEIGHT + (tabsBelowControls && headerVisible ? 28 : 0) } : undefined}
+          style={topEdge ? { height: titlebarHeight + (tabsBelowControls && headerVisible ? 28 : 0) } : undefined}
         >
           {topEdge && (
             <div aria-hidden="true" className="shrink-0" style={{ width: 'var(--panel-titlebar-left, 100%)' }} />
@@ -758,7 +769,7 @@ export function TreeGroup({
               )}
               data-window-drag-handle=""
               style={{
-                height: TITLEBAR_HEIGHT,
+                height: titlebarHeight,
                 width: headerVisible && tabsInTitlebar ? TITLEBAR_DRAG_HANDLE_WIDTH : undefined
               }}
             />
@@ -774,9 +785,29 @@ export function TreeGroup({
           `visibility` (not display) keeps the hidden pane's layout box, so
           scroll positions and measurements survive the round-trip — which also
           makes a hidden layer's rect identical to the visible one's, hence the
-          marker document-wide lookups filter on (see pane-visibility.ts). */}
+          marker document-wide lookups filter on (see pane-visibility.ts).
+          The body carries the zone's right-click menu too: a pane without a
+          header (no strip showing) otherwise has no Close anywhere on screen
+          (#92500) — same ZoneMenu the strip and the edit veil already serve. */}
       {(!node.minimized || mountedPanes.length > 0 || hostedPanes.length > 0) && (
-        <PaneBody hidden={Boolean(node.minimized)}>
+        <PaneBody
+          hidden={Boolean(node.minimized)}
+          wrap={
+            !isEmpty
+              ? body => (
+                  <ZoneMenu {...zoneMenu} includeAppActions>
+                    <div
+                      aria-label={t.zones.zoneMenuLabel(String(tabLabel(activeId)))}
+                      data-zone-body={node.id}
+                      style={{ display: 'contents' }}
+                    >
+                      {body}
+                    </div>
+                  </ZoneMenu>
+                )
+              : undefined
+          }
+        >
           {hostedPanes.map(paneId => (
             <KeepAlivePaneSlot
               groupId={node.id}
@@ -799,7 +830,10 @@ export function TreeGroup({
               return (
                 <div
                   aria-hidden={!isActive || undefined}
-                  className={cn('absolute inset-0 overflow-auto', !isActive && 'pointer-events-none invisible')}
+                  className={cn(
+                    'absolute inset-0 overflow-auto',
+                    !isActive && 'pointer-events-none invisible opacity-0'
+                  )}
                   inert={!isActive || undefined}
                   key={paneId}
                   {...hiddenPaneProps(!isActive)}
@@ -852,7 +886,7 @@ export function TreeGroup({
             className="absolute inset-x-0 bottom-0 z-50 flex cursor-grab items-center justify-center outline-1 -outline-offset-2 outline-dashed backdrop-blur-[2px]"
             onPointerDown={e => startPaneDrag(activeId, e, undefined, undefined, tabText(activeId))}
             style={{
-              top: topEdge ? TITLEBAR_HEIGHT + (tabsBelowControls && headerVisible ? 28 : 0) : headerVisible ? 28 : 0,
+              top: topEdge ? titlebarHeight + (tabsBelowControls && headerVisible ? 28 : 0) : headerVisible ? 28 : 0,
               background:
                 'color-mix(in srgb, var(--ui-accent) 6%, color-mix(in srgb, var(--ui-bg-chrome) 55%, transparent))',
               outlineColor: 'color-mix(in srgb, var(--ui-accent) 55%, transparent)'

@@ -437,7 +437,12 @@ export function useComposerActions({
         ? window.hermesDesktop?.getStagedFileForAttach?.(attachment.path)
         : undefined
 
-      scope.add(stagedUpload ? { ...attachment, stagedUpload } : attachment)
+      const displayName = attachment.kind === 'file' && attachment.path
+        && attachment.label === pathLabel(attachment.path)
+        ? window.hermesDesktop?.getStagedFileDisplayName?.(attachment.path)
+        : undefined
+
+      scope.add({ ...attachment, ...(stagedUpload ? { stagedUpload } : {}), ...(displayName ? { label: displayName } : {}) })
       requestComposerFocus(scope.target)
     },
     [scope]

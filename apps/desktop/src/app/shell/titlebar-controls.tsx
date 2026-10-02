@@ -4,7 +4,10 @@ import { type ComponentProps, type MouseEvent, type ReactNode, useEffect, useSta
 import { useLocation, useNavigate } from 'react-router'
 
 import { hudTargetSessionId } from '@/app/hud/handoff'
+import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
 import { toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
+import { $narrowOverlayPaneIds } from '@/components/pane-shell/narrow-overlay-state'
+import { $narrowViewport } from '@/components/pane-shell/tree/store'
 import { resetLayoutTree } from '@/components/pane-shell/tree/store'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -15,16 +18,20 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { formatModifierToken } from '@/lib/keybinds/combo'
 import { cn } from '@/lib/utils'
+import { recordAction } from '@/store/desktop-metrics'
 import { canUseHud, toggleHud } from '@/store/hud'
 import { $interfaceMode, shownInMode, type Tiered } from '@/store/interface-mode'
 import {
   $fileBrowserOpen,
+  $leftSideOpen,
   $panesFlipped,
-  $sidebarOpen,
-  toggleFileBrowserOpen,
+  CHAT_SIDEBAR_PANE_ID,
+  FILE_BROWSER_PANE_ID,
+  toggleLeftSide,
   togglePanesFlipped,
-  toggleSidebarOpen
+  toggleRightSide
 } from '@/store/layout'
+import { REVIEW_PANE_ID } from '@/store/review'
 import { $unreadSessionCount } from '@/store/session-dot-state'
 import { $titlebarAppActionsSide, TITLEBAR_FIXED_TOOLS } from '@/store/titlebar-app-actions'
 
@@ -43,6 +50,7 @@ export interface TitlebarTool extends Tiered {
   id: string
   label: string
   active?: boolean
+  expanded?: boolean
   className?: string
   disabled?: boolean
   hidden?: boolean
@@ -139,8 +147,10 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
   const location = useLocation()
   const modHeld = useModifierHeld()
   const fileBrowserOpen = useStore($fileBrowserOpen)
+  const leftSideOpen = useStore($leftSideOpen)
+  const narrow = useStore($narrowViewport)
+  const overlayPanes = useStore($narrowOverlayPaneIds)
   const panesFlipped = useStore($panesFlipped)
-  const sidebarOpen = useStore($sidebarOpen)
   const unreadCount = useStore($unreadSessionCount)
   const appActionsSide = useStore($titlebarAppActionsSide)
   const interfaceMode = useStore($interfaceMode)
@@ -159,13 +169,26 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
 
   // POSITIONAL toggles: each button shows/hides everything on its physical
   // side of the main zone (the layout tree collapses the whole side), so they
-  // stay correct through flips and rearranges. $sidebarOpen ≙ left side,
-  // $fileBrowserOpen ≙ right side. Never an active highlight — plain
-  // show/hide affordances.
-  const leftEdge = { open: sidebarOpen, toggle: toggleSidebarOpen }
-  const rightEdge = { open: fileBrowserOpen, toggle: toggleFileBrowserOpen }
+  // stay correct through flips and rearranges. Both edges resolve their column
+  // from the live tree (see toggleLeftSide / toggleRightSide) — the browser
+  // column, the sessions column, whatever is physically left / right. Never an
+  // active highlight — plain show/hide affordances.
+  const leftEdge = { open: narrow ? overlayPanes.has(CHAT_SIDEBAR_PANE_ID) : leftSideOpen, toggle: toggleLeftSide }
+  const rightOverlayId = overlayPanes.has(REVIEW_PANE_ID) ? REVIEW_PANE_ID : FILE_BROWSER_PANE_ID
+  const rightEdge = { open: narrow ? overlayPanes.has(rightOverlayId) : fileBrowserOpen, toggle: toggleRightSide }
   const leftLabel = leftEdge.open ? t.titlebar.hideSidebar : t.titlebar.showSidebar
   const rightLabel = rightEdge.open ? t.titlebar.hideRightSidebar : t.titlebar.showRightSidebar
+
+  // A visible hover reveal is not pinned: generic toggle would pin it rather
+  // than perform the labelled Hide action. Titlebar verbs are explicit;
+  // keyboard toggles retain their hover-to-pin behavior.
+  const toggleEdge = (id: string, open: boolean, toggleDocked: () => void) => {
+    if (narrow) {
+      window.dispatchEvent(new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id, mode: open ? 'close' : 'open' } }))
+    } else {
+      toggleDocked()
+    }
+  }
 
   const sidebarTool: TitlebarTool = {
     ...TITLEBAR_FIXED_TOOLS.sidebar,
@@ -173,10 +196,11 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
     badge: panesFlipped ? undefined : unreadBadge,
     icon: <TitlebarIcon name="layout-sidebar-left" />,
     id: 'sidebar',
+    expanded: leftEdge.open,
     label: `${leftLabel}${panesFlipped ? '' : unreadHint}`,
     onSelect: () => {
       triggerHaptic('tap')
-      leftEdge.toggle()
+      toggleEdge(CHAT_SIDEBAR_PANE_ID, leftEdge.open, leftEdge.toggle)
     }
   }
 
@@ -198,10 +222,11 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
     badge: panesFlipped ? unreadBadge : undefined,
     icon: <TitlebarIcon name="layout-sidebar-right" />,
     id: 'right-sidebar',
+    expanded: rightEdge.open,
     label: `${rightLabel}${panesFlipped ? unreadHint : ''}`,
     onSelect: () => {
       triggerHaptic('tap')
-      rightEdge.toggle()
+      toggleEdge(rightOverlayId, rightEdge.open, rightEdge.toggle)
     },
     tour: 'right-pane-toggle'
   }
@@ -389,12 +414,17 @@ function TitlebarToolButton({ navigate, tool }: { navigate: ReturnType<typeof us
   return (
     <Tip label={tooltipLabel} placement="toolbar">
       <Button
+        aria-expanded={tool.expanded}
         aria-label={tool.label}
         aria-pressed={tool.active ?? undefined}
         className={className}
         data-tour={tool.tour}
         disabled={tool.disabled}
         onClick={event => {
+          if (tool.actionId) {
+            recordAction(tool.actionId, 'click')
+          }
+
           if (tool.to) {
             navigate(tool.to)
           }

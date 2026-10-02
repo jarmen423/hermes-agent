@@ -1,6 +1,6 @@
 import type { Terminal } from '@xterm/xterm'
 
-import { writeClipboardText } from '@/components/ui/copy-button'
+import { writeClipboardText } from '@/lib/clipboard'
 import { triggerHaptic } from '@/lib/haptics'
 
 import { terminalClipboardIntent } from './clipboard'
@@ -39,12 +39,20 @@ export function bindTerminalActivity(term: Terminal, host: HTMLElement, markActi
   }
 }
 
-// Right-click menu and copy/paste chords. Paste counts as session activity.
-// Returns the context-menu registration teardown.
-export function bindTerminalClipboard(term: Terminal, host: HTMLElement, markActivity: () => void): () => void {
+// Right-click menu, the focus-routed Ctrl/Cmd+R, and copy/paste chords. Paste
+// and ^R count as session activity. Returns the context-menu registration teardown.
+export function bindTerminalClipboard(
+  term: Terminal,
+  host: HTMLElement,
+  markActivity: () => void,
+  writeInput: (data: string) => void,
+  hasSession: () => boolean
+): () => void {
   // The app context menu resolves right-clicks on this host through the
   // registered handle: xterm's selection is not a DOM selection, so the
-  // DOM resolver would see nothing here.
+  // DOM resolver would see nothing here. The same handle answers the
+  // focus-routed Ctrl/Cmd+R: main claimed the keystroke, so re-deliver the
+  // ^R byte to the PTY ourselves (#96482).
   const unregisterContextMenu = registerTerminalContextMenu(host, {
     getSelection: () => term.getSelection(),
     paste: text => {
@@ -52,7 +60,24 @@ export function bindTerminalClipboard(term: Terminal, host: HTMLElement, markAct
       term.focus()
       term.paste(text)
     },
-    selectAll: () => term.selectAll()
+    reload: () => {
+      markActivity()
+      writeInput('\x12')
+    },
+    selectAll: () => term.selectAll(),
+    // Main claimed the close-tab chord; preserve readline word erase while
+    // the shell is alive, and let the caller close a disconnected tab.
+    wordErase: () => {
+      markActivity()
+
+      if (!hasSession()) {
+        return false
+      }
+
+      writeInput('\x17')
+
+      return true
+    }
   })
 
   // Copy/paste chords. Returning false stops xterm from also sending the key

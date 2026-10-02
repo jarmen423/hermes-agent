@@ -143,6 +143,9 @@ def _scan_dashboard_processes(*, exclude_pids: set[int] | None = None) -> list[t
     probes and Desktop-owned excluded PIDs must never enter the reaper's result.
     """
     skip = {os.getpid(), *(exclude_pids or ())}
+    # Canonical token matcher, never argv substrings: ``hermes serve`` is a prefix of ``hermes
+    # server`` and this list decides a SIGTERM — ``herdr --session hermes server`` (a terminal
+    # multiplexer) was killed and its unit restarted by ``hermes update`` (#121156).
     positive = _ledger_web_server_processes()
     try:
         found = [(pid, cmd) for pid, cmd in _iter_process_table()
@@ -500,7 +503,7 @@ def _kill_pids_windows(pids: list[int], killed: list[int], failed: list[tuple[in
 
 # SIGTERM → SIGKILL grace for the dashboard/serve backend. Must outlast the lifespan teardown in
 # hermes_cli/web_server_lifespan.py::_lifespan: stop_hosted_room_service(timeout=5.0) + the startup-thread
-# join(1.0) + PTY_REGISTRY.close_all() (≤1.5s per attached Chat PTY, serial). A SIGKILL inside
+# join(1.0) + PTY_REGISTRY.close_all() (concurrent; ≤ ~4s per PTY, see pty_bridge._MAX_HELPER_SHUTDOWN_GRACE_S). A SIGKILL inside
 # that window skips close_all(), so the ui-tui / tui_gateway.entry children outlive the backend
 # and keep the deleted state.db-wal inode open — the next hermes start refuses with a FATAL
 # DeletedWalGenerationError (#111912). The orphan reaper's 1.5s (`_reap_orphaned_desktop_local_serves`)
@@ -1074,4 +1077,3 @@ def _reap_orphaned_desktop_local_serves(
     with contextlib.suppress(Exception):
         print(f"⟲ Reaped {len(killed)} orphaned desktop-local serve backend(s) ({reason}): {killed or matched}")
     return {"matched": matched, "killed": killed, "failed": failed}
-

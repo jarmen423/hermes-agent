@@ -17,6 +17,7 @@ import { $registryVersion } from '@/contrib/registry'
 import { matchesQuery, useMediaQuery } from '@/hooks/use-media-query'
 import { translateNow } from '@/i18n'
 import { persistString, persistStringRecord, storedString, storedStringRecord } from '@/lib/storage'
+import { recordFeatureUse } from '@/store/desktop-metrics'
 import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $connection } from '@/store/session'
@@ -32,11 +33,12 @@ import {
 } from './backend-sync'
 import { $chatFontFamily, resolveChatFontFamily } from './chat-font'
 import { harmonize, readableInk } from './color'
-import { BUILTIN_THEME_LIST, DEFAULT_SKIN_NAME, DEFAULT_TYPOGRAPHY, nousTheme } from './presets'
+import { BUILTIN_THEME_LIST, DEFAULT_SKIN_NAME, DEFAULT_TYPOGRAPHY, nousTheme, RETIRED_SKINS } from './presets'
 import {
   $profileAppearance,
   appearanceIsCurrent,
   markLocalAppearanceChange,
+  profileAppearanceOwner,
   type ProfileAppearancePatch,
   saveProfileAppearance
 } from './profile-appearance'
@@ -56,9 +58,6 @@ const PROFILE_MODES_KEY = 'hermes-desktop-profile-modes-v1'
 // Last active profile, recorded so the boot-time paint can pick that profile's
 // theme before the gateway reports which profile actually launched.
 const LAST_PROFILE_KEY = 'hermes-desktop-active-profile-v1'
-// Skins that no longer exist. A profile still pointing at one falls back to
-// DEFAULT_SKIN_NAME rather than painting a name nothing resolves.
-const RETIRED_SKINS = new Set(['nous-light', 'default', 'gold'])
 
 export type ThemeMode = 'light' | 'dark' | 'system'
 
@@ -145,8 +144,11 @@ const APPEARANCE_PREFS: Record<AppearanceField, Pick<ReturnType<typeof profilePr
   theme_mode: modePref
 }
 
-// Newest pick per (profile, field): only that pick may roll back.
-const latestPick = new Map<string, number>()
+// The boot cache keeps its existing per-profile format. Only the pick that
+// still owns a cache slot may roll it back: adopting another gateway's
+// config (even the same value) supersedes that pick.
+const latestPick = new Map<string, symbol>()
+const appearanceCacheKey = (profile: string, field: AppearanceField) => `${profile}\0${field}`
 
 /**
  * Cache a pick and write it to the profile's config.yaml. A failed write puts
@@ -156,8 +158,9 @@ const latestPick = new Map<string, number>()
  */
 function commitPick(profile: string, field: AppearanceField, value: string, onRollback: () => void): void {
   const pref = APPEARANCE_PREFS[field]
-  const key = `${profile}\0${field}`
-  const pick = (latestPick.get(key) ?? 0) + 1
+  const key = appearanceCacheKey(profile, field)
+  const pick = Symbol()
+  const owner = profileAppearanceOwner(profile)
   const previous = pref.own(profile)
 
   latestPick.set(key, pick)
@@ -169,7 +172,11 @@ function commitPick(profile: string, field: AppearanceField, value: string, onRo
     }
 
     pref.put(profile, previous)
-    onRollback()
+
+    if (profileAppearanceOwner(profile) === owner) {
+      onRollback()
+    }
+
     notifyError(error, translateNow('settings.config.autosaveFailed'))
   })
 }
@@ -555,15 +562,18 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   // written back. An unset value leaves the local pick painted (and may seed
   // the config from it once).
   const configAppearance = useStore($profileAppearance)
+  const appearanceOwner = profileAppearanceOwner(profileKey)
 
   useEffect(() => {
-    if (!configAppearance || configAppearance.profile !== profileKey || !appearanceIsCurrent(configAppearance)) {
+    if (!configAppearance || configAppearance.owner !== appearanceOwner || !appearanceIsCurrent(configAppearance)) {
       return
     }
 
     const { mode: configMode, theme } = configAppearance
 
     if (theme) {
+      latestPick.delete(appearanceCacheKey(profileKey, 'theme'))
+
       if (skinPref.own(profileKey) !== theme) {
         skinPref.put(profileKey, theme)
       }
@@ -572,6 +582,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     }
 
     if (configMode) {
+      latestPick.delete(appearanceCacheKey(profileKey, 'theme_mode'))
+
       if (modePref.own(profileKey) !== configMode) {
         modePref.put(profileKey, configMode)
       }
@@ -580,7 +592,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     }
 
     seedFromLocalPick(configAppearance)
-  }, [configAppearance, profileKey])
+  }, [appearanceOwner, configAppearance, profileKey])
 
   // Appearance is per-profile localStorage, and every desktop window is another
   // renderer on the same origin — so a switch made in the HUD (or any peer
@@ -664,6 +676,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   const setTheme = useCallback((name: string) => {
     const next = normalizeSkin(name)
+    recordFeatureUse('skins')
     const profile = liveProfile()
     setPreview(null)
     setThemeNameState(next)
@@ -675,6 +688,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const setMode = useCallback((next: ThemeMode) => {
+    recordFeatureUse('skins')
     const profile = liveProfile()
     setPreview(null)
     setModeState(next)
