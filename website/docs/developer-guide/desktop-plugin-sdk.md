@@ -198,6 +198,8 @@ interface PluginContext {
   addEventListener: (target: EventTarget, type: string, listener: EventListener, options?: AddEventListenerOptions | boolean) => () => void
   /** The curated OS door: native notification, open-external, reveal-in-file-manager, clipboard. */
   os: PluginOs
+  /** Lines in the core pet's speech bubble, attributed to this plugin (see "Pet bubble"). */
+  pet: PluginPet
   /** Plugin-scoped JSON persistence (keys live under `hermes.plugin.<id>.`). */
   storage: PluginStorage
 }
@@ -237,6 +239,7 @@ Import the area constants from the SDK; each area has its own `data` payload.
 | Theme | `THEMES_AREA` | `data` as a `DesktopTheme` |
 | Composer | `COMPOSER_AREAS.*` | render slots, or middleware / attachment providers |
 | Model menu rows | `MODEL_MENU_ROW_AREA` | `data: ModelMenuRowContribution` — a leading icon / trailing badge per model |
+| Kanban card badges | `KANBAN_CARD_AREAS.badges` | `data: KanbanCardBadgeContribution` — short text labels per card, painted by the board |
 | Appearance settings | `APPEARANCE_AREAS.extra` | `render` — controls appended to Settings → Appearance |
 | Plugin settings page | `SETTINGS_PLUGINS_AREA` (`'settings.plugins'`) | Use `ctx.registerSettingsPage({ id, title, render, icon?, order?, children? })` — your own entry (with sub-pages) under Settings → Plugins |
 
@@ -374,6 +377,11 @@ ctx.registerMany([
 
 Keybinds are user-rebindable in settings; `defaults` is just the initial binding.
 
+To trigger one of the app's **own** actions (toggle the browser panel, open
+Settings, focus the composer), never dispatch a synthetic `KeyboardEvent` for its
+shortcut — the user may have rebound it. Call
+[`ctx.runAction(id)`](#run-app-actions) instead.
+
 ### Themes
 
 A theme contribution ships a full `DesktopTheme` as its `data` (name, label,
@@ -421,8 +429,8 @@ host.onEvent('gateway.ready', () => {
 
 Both doors persist per profile, so a plugin-driven switch sticks exactly like a
 manual pick. To tint the *active* theme rather than replace it, use
-`setAccentOverride(hex)` and clear it in `ctx.onDispose` — the standalone
-[Accent Picker](https://github.com/NousResearch/hermes-desktop-accent-picker)
+`setAccentOverride(hex)` and clear it in `ctx.onDispose` — the official
+[Accent Picker](https://github.com/NousResearch/hermes-official-plugins/tree/main/accent-picker)
 plugin is the worked example (it is also a complete, installable disk plugin).
 
 #### Styling the chat switch — `data-session-switching`
@@ -467,7 +475,7 @@ whole migration.
 ### Composer extensions
 
 `COMPOSER_AREAS` (`top`, `bottom`, `underside`, `leading`, `actions`,
-`attachments`, `middleware`) let a plugin add controls around the message
+`attachments`, `middleware`, `contextMenu`) let a plugin add controls around the message
 composer, provide an attachment source, or transform a draft before it is sent
 (`ComposerMiddleware` with a `handler(draft) => draft | null`). `top` is a
 banner strip above the input and `bottom` a row below the input grid, both
@@ -475,6 +483,89 @@ inside the composer chrome; `underside` is the floating strip BELOW the whole
 composer with no chrome of its own — the seat for a suggestion pill or a status
 hint that should sit outside the input frame (the next-prompt plugin renders its
 "next prompt" pill there).
+
+### Composer context menu — rows on a right-click in the input {#composer-context-menu}
+
+`COMPOSER_AREAS.contextMenu` adds rows to the menu the app opens when the user
+right-clicks **the composer** (the main input or the message-edit composer).
+A contribution is data: an `items(context)` function the app calls once per
+right-click. The app renders the rows with its own menu items, so they focus,
+style and keyboard-navigate like the built-in ones; a plugin never touches the
+menu's DOM.
+
+```javascript
+import { COMPOSER_AREAS, host } from '@hermes/plugin-sdk'
+
+ctx.register({
+  id: 'spelling',
+  area: COMPOSER_AREAS.contextMenu,
+  data: {
+    // context = { word: string | null, selection: string } — nothing else.
+    items: ({ word }) => {
+      if (!word || isKnown(word)) return []
+
+      return [
+        ...suggest(word).slice(0, 5).map(suggestion => ({
+          label: suggestion,
+          // Runs after the menu closed, with the caret back in the composer.
+          onSelect: action => action.replaceWord(suggestion)
+        })),
+        { label: ctx.i18n.t('addToDictionary'), onSelect: () => void host.spellcheck.addWord(word) }
+      ]
+    }
+  }
+})
+```
+
+```ts
+interface ComposerContextMenuContext {
+  word: string | null // the word under the caret (or at the selection's start)
+  selection: string // the selected composer text, '' when the caret is collapsed
+}
+
+interface ComposerContextMenuItem {
+  label: string // plain text: controls/bidi overrides stripped, clamped to 80 chars
+  disabled?: boolean
+  onSelect: (action: ComposerContextMenuAction) => void
+}
+
+interface ComposerContextMenuAction extends ComposerContextMenuContext {
+  replaceWord(text: string): boolean // one line, <= 200 chars
+}
+```
+
+**What the app owns.** It decides the click landed on a composer; any other
+field (Settings inputs, API keys, dialogs, the transcript) never consults a
+provider. A provider sees two strings — the word and the composer selection
+(capped at 2,000 chars) — never the element, a `Range` or other text.
+`replaceWord` is the only edit it offers: it replaces exactly the word the user
+right-clicked through Chromium's own editing command, works once, and returns
+`false` (changing nothing) when the composer no longer holds that word in that
+place. For anything else, use [`host.composer`](#composer-draft-api--read-and-write-the-live-input).
+
+**Arbitration.** Each plugin gets its own section, placed after the app's own
+spell-check rows and before Cut / Copy / Paste. Plugins are ordered by plugin id
+(code-point order, then contribution id); load order and `order` play no part.
+A plugin shows at most **six rows** across all its contributions; extra rows are
+dropped. A provider that throws, returns a non-array, or a row without a string
+label or an `onSelect` function contributes nothing and leaves every other row
+standing; a throwing `onSelect` is logged, not raised. Rows registered through
+`ctx.register` disappear when the plugin unloads or is disabled — including
+from a menu that is open at the time.
+
+#### Spell-check dictionary — `host.spellcheck`
+
+```ts
+host.spellcheck.addWord(word: string): Promise<boolean>
+host.spellcheck.removeWord(word: string): Promise<boolean>
+```
+
+Adds or removes one word in the app's Chromium spell-check dictionary, so the
+red underline clears (or returns) everywhere in the app. The main process takes
+only one bounded word: letters, combining marks, digits and inner `'` / `-`,
+at least one letter, at most 64 characters. Anything else resolves `false`
+without touching the dictionary; so does an older desktop shell. There is no
+way to list or read the dictionary.
 
 ### Composer draft API — read and write the live input
 
@@ -543,7 +634,8 @@ A multi-session plugin keeps its per-session state on its side (which session
 its panel is editing) and passes that id here; the bus guarantees one
 plugin write can never land in another session's composer.
 
-**Migrating off DOM reach-in** (the held catalog plugins that motivated this API):
+**Migrating off DOM reach-in** (the held catalog plugins that motivated this API
+and its siblings; the pet-wallet row uses the [pet bubble](#pet-bubble) door):
 
 | Plugin | Was | Now |
 |---|---|---|
@@ -552,6 +644,8 @@ plugin write can never land in another session's composer.
 | prompt-enhancer (#116031) | walks the editor's child nodes to serialize, rebuilds chip DOM, `replaceChildren` + synthetic `InputEvent` | `const draft = await host.composer.getDraft(sid)` → transform → `await host.composer.setDraft(sid, enhanced)` (chips hydrate app-side); revert is another `setDraft` |
 | memory-review (#115966) | `host.request('slash.exec', { session_id, command })` for `/memory …` — already SDK-only | optional: `host.composer.insertText(sid, '/memory pending', { mode: 'prefix' })` to seat the command for the user instead of executing it |
 | intelligent-tool-break (#115964) | "Message" button only toasts "type /break" (no composer write) | `host.composer.setDraft(host.state.focusedSessionId.get(), '/break ')` then `host.composer.focus(null)` restores the intended behaviour |
+| pet-wallet (#135178) | `document.querySelector('canvas[aria-label$=" pet"]')` to find the core pet, a `position:fixed; z-index:9999` overlay on `document.body` that follows it every frame, document-wide capture-phase pointer listeners | `ctx.pet.say(text, { id: 'balance', tone?, ttlMs? })` — the core bubble shows it over the pet, in-window and popped out, labelled with the plugin name; `ctx.pet.visible` tells you when there is no pet so you can fall back to your status-bar chip |
+| browser-toggle | `document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'L', ctrlKey: true, shiftKey: true, … }))` to fake the built-in browser-panel shortcut; silently stops working when the user rebinds or unbinds it | `ctx.runAction('view.showBrowser')` — runs the same handler as the shortcut and the palette entry, whatever the binding ([run app actions](#run-app-actions)) |
 
 `sessionId` in the table is the id the plugin's UI is bound to; for a composer
 slot render it is `host.state.focusedSessionId.get()`.
@@ -748,6 +842,96 @@ by a `MutationObserver` that located the rows in the menu's DOM and wrote mask
 images onto them. The same marks come from `decorate({ provider })` returning
 `{ icon: <img alt="" src={providerSvgDataUrl(provider)} /> }` — no DOM reads,
 and the row keeps working when the menu's markup changes.
+
+#### Kanban card badges {#kanban-card-badges}
+
+`KANBAN_CARD_AREAS.badges` puts small text labels on Kanban card tiles: a
+tenant, a CI state, an estimate. A contribution supplies `decorate(card)`; the
+board paints what it returns as chips in a fixed row above the card's title.
+The card's markup, layout, drag and drop, click and context menu stay the
+board's, and the row takes no space on cards no plugin has a badge for.
+
+```ts
+import {
+  KANBAN_CARD_AREAS,
+  KANBAN_CARD_BADGE_HUES,
+  type KanbanCardBadgeContribution
+} from '@hermes/plugin-sdk'
+
+interface KanbanCard {            // frozen; identity and routing fields only
+  id: string                      // task id (t_…): key your own per-card data by it
+  status: string                  // the column: 'triage', 'ready', 'running', …
+  tenant: string | null
+  assignee: string | null
+}
+interface KanbanCardBoard {       // frozen; shared by every card on the board
+  tenants: readonly string[]      // every tenant on the board (its filter menu's list)
+}
+interface KanbanCardBadge {
+  label: string                   // plain text
+  tone?: KanbanCardBadgeTone      // 'neutral' (default) or one of KANBAN_CARD_BADGE_HUES
+  tooltip?: string                // plain text hover line
+}
+
+ctx.register({
+  area: KANBAN_CARD_AREAS.badges,
+  id: 'tenant',
+  data: {
+    // `tenants` lets you give each tenant on the board its own hue instead of
+    // hashing blind (two tenants can hash to the same one).
+    decorate: ({ tenant }, { tenants }) =>
+      tenant
+        ? { label: tenant, tone: KANBAN_CARD_BADGE_HUES[distinctIndex(tenant, tenants) % 12], tooltip: `Tenant: ${tenant}` }
+        : null
+  } satisfies KanbanCardBadgeContribution
+})
+```
+
+`decorate(card, board)` may return one badge, an array, or `null` for cards it
+has nothing to say about. The card view carries no prose (title, body, summaries,
+comments, run output); look up anything else you need by `id` in your own data
+(`ctx.rest` to your backend, `ctx.storage`). Both views are frozen.
+
+**What the board accepts** (`KANBAN_CARD_BADGE_LIMITS`):
+
+- **Text only.** `label` and `tooltip` must be strings and render as text, never
+  markup. Control characters, bidi overrides and zero-width characters are
+  removed, whitespace is collapsed, and text past 24 characters (`label`) or
+  160 characters (`tooltip`) is shortened with an ellipsis. An empty or
+  non-string label is ignored. Any other field (`render`, `html`, a style) is
+  ignored.
+- **A fixed palette.** `tone` is `'neutral'` or one of the twelve
+  `KANBAN_CARD_BADGE_HUES` (`'red'`, `'orange'`, … `'pink'`, the app's identity
+  hues in hue order, the same set as `PROFILE_SWATCHES`). Anything else paints
+  neutral. The board picks the actual colors for the theme.
+- **Two badges per plugin per card**, counted across all of the plugin's
+  contributions to this area. Extra badges are dropped.
+- **Attribution.** Every badge's tooltip ends with the plugin's name, so a user
+  can always tell which plugin painted it.
+
+**Arbitration.** Every plugin's badges show side by side; no plugin can hide,
+reorder or restyle another's. The row is ordered by plugin id, then
+contribution id, then the order `decorate` returned them. A contribution's
+`order` field is ignored here, so load order and bidding cannot move a badge.
+A decorator that **throws** contributes nothing (logged once) and the rest of
+the row still paints.
+
+**Updates and teardown.** `decorate()` re-runs when the registry changes,
+when the card's id, status, tenant or assignee changes, or when the board's
+tenant list changes, so keep it a pure lookup. When your own data changes (a user pins a new color in your settings
+page), call `ctx.register` again with the same `id`: the new registration
+replaces the old one and the board repaints. Keep the latest disposer; the
+first one would remove the replacement. On disable, reload or unload, the
+host removes the contribution and the cards repaint without its badges;
+nothing to undo in `ctx.onDispose`.
+
+**Migrating a DOM-decorating plugin** (kanban-tenant-labels): delete the route
+poll, the `MutationObserver`, the tile matching, the inserted `<span>` and the
+reads of the Kanban plugin's query cache. The whole decoration becomes the
+`ctx.register` call above. Its collision-free assignment runs on
+`board.tenants` instead of the query-cache snapshot, and its color pins map to
+`KANBAN_CARD_BADGE_HUES` (its twelve hues are the same `hsl(n×30 68% 58%)`
+set, in the same order).
 
 ### Appearance settings
 
@@ -1070,6 +1254,13 @@ host.state.profile          // ReadableAtom<string>
 host.state.viewport         // ReadableAtom<{ width, height, narrow }>
 ```
 
+`gatewayActivationEpoch` is a named SDK export: `import { gatewayActivationEpoch } from '@hermes/plugin-sdk'`.
+It reads the canonical activation counter, which changes on every active route
+selection, including same-profile source swaps. Capture `const epoch = gatewayActivationEpoch()`
+alongside the route before asynchronous work, then check both the captured route
+and `gatewayActivationEpoch() === epoch` before mutation or UI publication. This
+read-only counter is not a credential, permission grant, or durable gateway/session identity.
+
 `host.state.gateway` is the WebSocket connection, not whether a chat turn is
 running. A session can be mid-turn while the socket is `open`; another session
 can be idle at the same time. Disable composer or plugin actions from the
@@ -1085,6 +1276,11 @@ ctx.os.notify({ title, body?, silent?, icon?, activate?, onActivate?, actions? }
 ctx.os.openExternal(url)                   // OS default handler (browser, mail, spotify:) → Promise<boolean>
 ctx.os.revealPath(path)                    // reveal in Finder / Explorer → Promise<boolean>
 ctx.os.writeClipboard(text)                // system clipboard → Promise<boolean>
+ctx.pet.say(text, { id?, tone?, ttlMs? })   // line in the core pet's speech bubble → disposer
+ctx.pet.clear(id?)                         // drop one line (or all of yours)
+ctx.pet.visible                            // ReadableAtom<boolean> — is a pet on screen?
+ctx.runAction('view.showBrowser')          // run a built-in app action → { ok: true } | { ok: false, reason, error }
+ctx.listActions()                          // [{ id, label, category }] — the ids runAction accepts
 host.navigate('/route')                    // hash-route navigation
 host.openSession(id, { profile?, intent? }) // open a stored session core-style;
                                            //   profile: soft-swap to that profile's backend first
@@ -1127,12 +1323,13 @@ profile without changing the active chat or gateway. The profile-only overload i
 retained only for the sole-local/legacy topology; registry-aware plugins should pass
 the descriptor so two sources exposing the same profile name cannot collide.
 
-A call that may cold-start a pooled profile backend dials at background priority by
-default, and background dials never get the slot the pool keeps free for user actions.
-When the call IS a user action (a save, a button press, a dialog opening), pass
-`host.requestProfile(route, method, params, undefined, { spawnPriority: 'foreground' })`;
-otherwise, with the pool full of warm backends, it waits out the 30-second slot timeout
-and fails. Keep the background default for polling and roster warming.
+A call that has to open a connection to another profile dials at background priority
+by default. After a failed dial to that profile, background calls fail fast while the
+reconnect backoff runs (`Backend for "<profile>" is reconnecting; retry after it settles.`)
+instead of redialing on every tick. When the call IS a user action (a save,
+a button press, a dialog opening), pass
+`host.requestProfile(route, method, params, undefined, { spawnPriority: 'foreground' })`
+so it dials at once. Keep the background default for polling and roster warming.
 
 `host.openWorkspace(id, { render, title?, minWidth?, onClose? })` docks a
 plugin-rendered view into the **main workspace zone** — the same center area
@@ -1200,6 +1397,35 @@ listener can't affect app dispatch. Every `host` door is async-safe: a sync thro
 from an internal helper (e.g. no desktop bridge in a plain browser) becomes a
 rejection your `.catch()` sees, never an error-boundary crash.
 
+#### Live tool progress — `tool.progress` {#tool-progress-event}
+
+While a tool call runs, an MCP server that sends `notifications/progress` (the
+MCP spec's progress channel; Hermes opts in by sending `_meta.progressToken` on
+every `tools/call`) reaches the renderer as a `tool.progress` event. The native
+tool row shows it as `42% · <message>` next to its timer; a plugin can render
+its own view:
+
+```javascript
+ctx.onEvent('tool.progress', ({ session_id, payload }) => {
+  // payload: { tool_id, name, progress, total, percent, message }
+  if (payload.name.startsWith('mcp__meshy__')) showRefineProgress(payload.tool_id, payload.percent, payload.message)
+})
+ctx.onEvent('tool.complete', ({ payload }) => clearRefineProgress(payload.tool_id))
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `tool_id` | `string` | The call id; the same `tool_id` as the call's `tool.start` / `tool.complete` |
+| `name` | `string` | Registered tool name (`mcp__<server>__<tool>`) |
+| `progress` | `number` | The server's raw progress value |
+| `total` | `number \| null` | The server's total, when it sent one |
+| `percent` | `number \| null` | `0`–`100` (rounded, clamped) when `total` is set, else `null` |
+| `message` | `string \| null` | The server's progress message |
+
+Events are throttled to at most one per 500 ms per call; the first update and
+the one that reaches `total` always arrive. They are never stored in the
+transcript, so a reopened session shows only the finished row.
+
 `ctx.os` is the curated OS door — every way a plugin reaches outside the app
 window, in one namespace attributed to your plugin. `ctx.os.notify` posts a
 **native OS notification** — the same Electron pipeline the app's own
@@ -1237,6 +1463,140 @@ happens on user click — never from a background event alone.
 The other doors (`openExternal`, `revealPath`, `writeClipboard`) resolve
 `false` instead of throwing when the capability isn't available (older desktop
 shell, plain browser) — branch on the result rather than sniffing the bridge.
+
+### Pet bubble — `ctx.pet` {#pet-bubble}
+
+The core pet (the petdex mascot, in-window or popped out into its own OS
+window) has a speech bubble. `ctx.pet` lets a plugin put a short line in it,
+so you never have to find the pet in the app DOM or float your own overlay
+over it:
+
+```ts
+register(ctx) {
+  // Shows "DeepSeek ¥12.40 left" over the pet for 8 s, labelled "Pet Wallet".
+  const dispose = ctx.pet.say('DeepSeek ¥12.40 left', { id: 'balance', ttlMs: 8000 })
+
+  // Same id → replaces the line in place (a refreshed balance, a countdown).
+  ctx.pet.say('DeepSeek ¥11.90 left', { id: 'balance' })
+
+  // Tones: 'info' (default), 'wait' (clock glyph), 'error' (alert glyph).
+  ctx.pet.say('Codex 5h quota at 90%', { id: 'quota', tone: 'wait' })
+
+  dispose()              // remove early, or
+  ctx.pet.clear('quota') // by id, or ctx.pet.clear() for all of yours
+
+  // No pet on screen? Fall back to your own status-bar chip or pane.
+  const visible = ctx.pet.visible.get()
+}
+```
+
+```ts
+interface PluginPet {
+  say(text: string, options?: { id?: string; tone?: 'info' | 'wait' | 'error'; ttlMs?: number }): () => void
+  clear(id?: string): void
+  visible: ReadableAtom<boolean>
+}
+```
+
+What the host guarantees, so you don't have to:
+
+- **Plain text.** Control characters and bidi overrides are stripped,
+  whitespace collapses to one line, and the text is capped at 120 characters.
+  It renders as a text node; markup shows literally.
+- **Attributed.** Your plugin's name (from the Plugins inventory) is printed
+  above the line, so the user can tell your words from the pet's.
+- **Short-lived.** Each line expires after `ttlMs` (default 6 s, clamped to
+  1–30 s). Re-`say` with the same `id` to keep a value up. At most 3 lines per
+  plugin are live (the oldest is evicted) and the bubble shows the newest
+  line from any plugin.
+- **Rate-limited.** 10 `say` calls per plugin per 10 s; extra calls are dropped
+  with a console warning and return a no-op disposer.
+- **Core first.** When the agent hits an error or is waiting on the user, the
+  core status bubble wins; your line shows again once that clears (if it
+  hasn't expired).
+- **The user's pet setting wins.** If no pet is adopted, or it is turned off,
+  nothing shows. `ctx.pet.visible` lets you branch on that.
+- **Cleaned up with you.** Disabling, unloading, or hot-reloading your plugin
+  removes every line it still has up.
+
+In-window, the bubble appears only for plugin lines (the app itself shows the
+agent's status). In the popped-out overlay, plugin lines share the bubble with
+the core status lines. The overlay is a separate window that loads no plugin
+code; the main window sends it the live lines with the rest of the pet state.
+
+Pointer input on the pet (drag, shift-click pop-out, overlay click) belongs to
+the host and has no plugin hook. Use a palette command, a status-bar item, or
+your own pane for actions.
+
+### Run app actions — `ctx.runAction` {#run-app-actions}
+
+The app's own commands — the ones behind keyboard shortcuts and the command
+palette — can be run by id. The plugin gets exactly the handler the shortcut
+runs, so the user rebinding (or unbinding) that shortcut in Settings ▸ Keyboard
+Shortcuts changes nothing for you:
+
+```ts
+import { TITLEBAR_AREAS } from '@hermes/plugin-sdk'
+import { jsx } from 'react/jsx-runtime'
+
+register(ctx) {
+  ctx.register({
+    id: 'browser',
+    area: TITLEBAR_AREAS.right,
+    render: () => jsx('button', { onClick: () => ctx.runAction('view.showBrowser'), children: 'Browser' })
+  })
+
+  // Results are values, never exceptions.
+  const result = ctx.runAction('nav.settings')
+  if (!result.ok) console.log(result.reason, result.error)
+
+  // Discover what is allowed (labels are localized, same as the shortcuts panel).
+  for (const { id, label } of ctx.listActions()) console.log(id, label)
+}
+```
+
+```ts
+interface PluginContext {
+  runAction(id: PluginAppActionId): PluginRunActionResult
+  listActions(): Array<{ id: PluginAppActionId; label: string; category: string }>
+}
+
+type PluginRunActionResult =
+  | { ok: true }
+  | { ok: false; reason: 'unknown' | 'denied' | 'unavailable'; error: string }
+```
+
+Only view and navigation actions are allowed. `PluginAppActionId` is the typed
+union; `PLUGIN_APP_ACTIONS` is the same list at runtime:
+
+| Id | What it does |
+|---|---|
+| `view.showBrowser` | Toggle the browser panel |
+| `view.showFiles` | Show the file browser |
+| `view.toggleSidebar` | Toggle the left sidebar |
+| `view.toggleRightSidebar` | Toggle the right side |
+| `view.toggleReview` | Toggle the review (git) pane |
+| `view.toggleStatusbar` | Toggle the status bar |
+| `view.findInPage` | Open find-in-page |
+| `composer.focus` | Focus the composer |
+| `session.new` | Start a new chat |
+| `session.focusSearch` | Focus session search |
+| `conversation.scrollPageUp` / `conversation.scrollPageDown` | Scroll the transcript a page |
+| `nav.commandPalette` | Toggle the command palette |
+| `nav.settings`, `nav.profiles`, `nav.capabilities`, `nav.messaging`, `nav.artifacts`, `nav.cron`, `nav.agents` | Open that page |
+| `keybinds.openPanel` | Open Settings ▸ Keyboard Shortcuts |
+
+Anything else is refused: `{ ok: false, reason: 'denied' }` for a real app
+action that is not on the list (archive, pin, profile / model / reasoning
+switches, terminals, new window, open folder, HUD, close tab, …),
+`reason: 'unknown'` for an id that does not exist. Either way nothing runs and a
+`[plugin:<id>] runAction: …` warning is logged. `reason: 'unavailable'` means the
+app shell that owns the handlers is not mounted yet (very early startup); retry
+from a user action. Destructive and privileged operations (deleting sessions,
+signing out, approvals, model/provider changes, updates, quitting) are not app
+actions a plugin can run.
+
+Feature-detect on older hosts: `ctx.runAction?.('view.showBrowser')`.
 
 ### Desktop appearance settings — `host.settings`
 
@@ -1543,6 +1903,32 @@ such damage and replaced on the next **Rescan**, while a marker-less folder
 that *does* hold a `plugin.js` is a standalone plugin you installed by hand and
 is never overwritten.
 
+#### Developing a unified package
+
+The app loads the **copy** in `desktop-plugins/<id>/`, not your package. An
+installed package (catalog, Git URL, `file://` path) is refreshed only when its
+source `plugin.js` is newer than the copy and something asks — **Rescan** in
+**Capabilities → Plugins**, an install/update through the app, or a restart —
+so editing `~/.hermes/plugins/<id>/desktop/plugin.js` in place does nothing
+on screen until then. Develop from a checkout linked into `plugins/` instead:
+
+```bash
+ln -s ~/src/my-plugin ~/.hermes/plugins/my-plugin
+```
+
+A linked package's copy is marked `"linked": true`. The app watches the
+checkout's `desktop/plugin.js`; every save re-syncs the copy (by content, not
+mtime, so `git stash pop` counts) and hot-reloads the plugin. Catalog and Git
+installs keep the mtime rule.
+
+`hermes plugins doctor <path-or-id>` warns when the copy differs from your
+source and names the copy it found:
+
+```text
+WARN: Desktop runs a stale copy of desktop/plugin.js (~/.hermes/desktop-plugins/my-plugin);
+your edits are not loaded. Refresh it with Capabilities → Plugins → Rescan …
+```
+
 Two enable switches still apply, on purpose, and both default to **off**: the
 desktop half ships opt-in — it inventories in **Capabilities → Plugins** but stays
 disabled until the user toggles it — matching the Python half's
@@ -1651,10 +2037,10 @@ your handler). Where it lands depends on the process the call runs in:
 
 | Caller runs in | Reaches |
 |---|---|
-| `hermes serve` (the Desktop backend): `plugin_api.py` routers, plugin slash commands, tools and hooks in the agent turn | every connected Desktop window |
-| the `dashboard.turn_isolation` compute-host child (tools/hooks of an isolated turn) | relayed over the host pipe to `hermes serve`, then every window |
+| the process Desktop is connected to — the host gateway a local Desktop attaches to, or a remote `hermes serve`: `plugin_api.py` routers, plugin slash commands, tools and hooks in the agent turn | every Desktop window connected to that process |
+| the `dashboard.turn_isolation` compute-host child (tools/hooks of an isolated turn) | relayed over the host pipe to its parent process, then every connected window |
 | the stdio TUI (`hermes` in a terminal) | that terminal's client |
-| `hermes gateway run` (messaging platforms), `hermes chat`, cron, `hermes plugins validate` | nobody — no Desktop client is attached to that process; the call is a logged no-op |
+| `hermes chat`, cron, `hermes plugins validate`, or a gateway with no Desktop window connected | nobody — no Desktop client is attached to that process; the call is a logged no-op |
 
 Use this instead of importing `tui_gateway.server` internals; for plugin-scoped frames
 with a payload tailored per connection, `ctx.socket('/events')` remains the
@@ -1689,6 +2075,32 @@ address another plugin's API or a core route through it. `PluginRestOptions` is
 on OAuth remotes** (single-use WS tickets are core-managed) — treat the socket as
 an accelerator over polling, never a replacement. Every consumer needs a polling
 fallback anyway, since any socket can drop.
+
+How it authenticates depends on the backend: a token-mode remote gets the same
+`?token=` query credential the app's own sockets use; a **local gateway** (no
+static token) authenticates with the native grant your `ctx.rest` calls carry.
+Desktop's main process mints it for the active profile and attaches it as a
+header to that one dial, so it never appears in a URL your code sees. The grant
+is bound to your plugin's namespace and that profile; the gateway refuses the
+upgrade if the plugin is disabled for that profile (the launch profile's setting
+does not apply). A secondary profile's plugin that runs in its plugin host gets
+HTTP 501 instead, because the host does not carry websockets yet.
+
+When the socket gives up (your polling fallback is then the only feed):
+
+- **Keeps retrying**, with jittered backoff capped at 30 s, while Desktop can't
+  resolve the gateway connection or mint the grant yet, or dials fail to open.
+  The client can't tell a refused upgrade from a gateway that is restarting,
+  draining or being re-ensured, so the socket keeps retrying through a restart
+  of any length and reconnects once the gateway answers again.
+- **Stops after 5 in a row** of refusals that don't clear by themselves: Desktop
+  refusing to mint the grant for a permission reason (an unsafe gateway control
+  path or profile home), or your backend accepting the socket and closing it at
+  once. A socket that stays open resets the count.
+- **Starts again** when the active connection or profile changes, with a fresh
+  count, or when the view remounts. A profile switch also moves a live socket:
+  Desktop closes the one bound to the old profile, drops a grant still being
+  minted for it, and dials for the new profile.
 
 For gateway-wide data (not your own namespace), use `host.request` (JSON-RPC) and
 `host.onEvent` (the gateway event stream) instead.
@@ -1793,10 +2205,10 @@ pipeline as a trust boundary.
 
 | Category | Exports |
 |----------|---------|
-| Host | `host` (`.state.*`, `.settings`, `.notify`, `.notifyError`, `.navigate`, `.onEvent`, `.logs`, `.status`, `.restartGateway`, `.request`, `.composer`, `.sessions`, `.skills`, `.toolsets`, `.profiles`, `.pluginDecisions`) |
-| Plugin contract | `HermesPlugin`, `PluginContext`, `PluginContribution`, `PluginStorage`, `PluginOs`, `PluginRestOptions`, `PluginNativeNotificationInput`, `PluginNotificationAction`, `HermesOpenTarget`, `Contribution` |
-| Area constants | `PANES_AREA`, `ROUTES_AREA`, `SIDEBAR_NAV_AREA`, `STATUSBAR_AREAS`, `TITLEBAR_AREAS`, `WORKSPACE_PAGE_HEADER_AREA`, `PALETTE_AREA`, `KEYBINDS_AREA`, `THEMES_AREA`, `COMPOSER_AREAS`, `MODEL_MENU_ROW_AREA`, `SESSION_ROW_AREAS`, `SIDEBAR_NAV_PREFS_AREA`, `APPEARANCE_AREAS`, `SETTINGS_PLUGINS_AREA` |
-| Area payloads | `PluginSettingsPage`, `PluginSettingsSubpage` (+ `pluginSettingsHref`), `RouteContribution`, `SidebarNavContribution`, `StatusbarItem`, `TitlebarTool`, `PaletteContribution`, `KeybindContribution`, `ComposerMiddleware`, `ComposerAttachmentProvider`, `SessionRowSlotContribution`, `SidebarNavPrefsContribution` |
+| Host | `host` (`.state.*`, `.settings`, `.notify`, `.notifyError`, `.navigate`, `.onEvent`, `.logs`, `.status`, `.restartGateway`, `.request`, `.composer`, `.spellcheck`, `.sessions`, `.skills`, `.toolsets`, `.profiles`, `.pluginDecisions`) |
+| Plugin contract | `HermesPlugin`, `PluginContext`, `PluginContribution`, `PluginStorage`, `PluginOs`, `PluginPet`, `PetSayOptions`, `PetMessageTone`, `PluginAppActionId`, `PluginAppActionInfo`, `PluginRunActionResult`, `PLUGIN_APP_ACTIONS`, `PluginRestOptions`, `PluginNativeNotificationInput`, `PluginNotificationAction`, `HermesOpenTarget`, `Contribution` |
+| Area constants | `PANES_AREA`, `ROUTES_AREA`, `SIDEBAR_NAV_AREA`, `STATUSBAR_AREAS`, `TITLEBAR_AREAS`, `WORKSPACE_PAGE_HEADER_AREA`, `PALETTE_AREA`, `KEYBINDS_AREA`, `THEMES_AREA`, `COMPOSER_AREAS`, `MODEL_MENU_ROW_AREA`, `KANBAN_CARD_AREAS`, `SESSION_ROW_AREAS`, `SIDEBAR_NAV_PREFS_AREA`, `APPEARANCE_AREAS`, `SETTINGS_PLUGINS_AREA` |
+| Area payloads | `PluginSettingsPage`, `PluginSettingsSubpage` (+ `pluginSettingsHref`), `RouteContribution`, `SidebarNavContribution`, `StatusbarItem`, `TitlebarTool`, `PaletteContribution`, `KeybindContribution`, `ComposerMiddleware`, `ComposerAttachmentProvider`, `ComposerContextMenuProvider` (+ `ComposerContextMenuItem`, `ComposerContextMenuContext`, `ComposerContextMenuAction`), `SessionRowSlotContribution`, `KanbanCardBadgeContribution` (+ `KanbanCard`, `KanbanCardBoard`, `KanbanCardBadge`, `KanbanCardBadgeTone`, `KANBAN_CARD_BADGE_HUES`, `KANBAN_CARD_BADGE_LIMITS`), `SidebarNavPrefsContribution` |
 | React / state | `useValue`, `atom`, `computed`, `useQuery`, `useMutation`, `useQueryClient`, `queryClient`, `Contribute`, `WorkspacePageHeaderControl` |
 | Theming | `useTheme`, `requestTheme`, `setAccentOverride`, `$accentOverride`, `retintTheme`, `themeHue`, `DesktopTheme`, `DesktopThemeColors`, plus OKLCH math (`hexToOklch`, `oklchToHex`, `oklchToSrgb255`, `mixOklab`, `maxChroma`, `hueDelta`, `normalizeHex`) and sRGB measures (`contrastRatio` — `number | null`, null for unparseable input — `readableOn`) |
 | UI kit | `Button`, `Input`, `Textarea`, `Select*`, `Switch`, `Checkbox`, `SegmentedControl`, `Tabs*`, `Dialog*`, `ConfirmDialog`, `DropdownMenu*`, `ContextMenu*`, `Popover*`, `Tip`/`Tooltip*`, `Badge`, `Kbd`/`KbdGroup`, `SearchField`, `ScrollArea`, `Separator`, `Skeleton`, `GlyphSpinner`, `Loader`, `EmptyState`, `ErrorState`, `CopyButton`, `StatusDot`, `LogView`, `Codicon`, `DecodeText`, `SandboxedFrame` |
