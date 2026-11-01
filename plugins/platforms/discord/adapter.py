@@ -1202,7 +1202,8 @@ class VoiceReceiver:
 
 
 from plugins.platforms.discord.adapter_config_readers import (
-    _DISCORD_PROMPT_TIMEOUT_DEFAULT, _DISCORD_PROMPT_TIMEOUT_MIN, _read_discord_prompt_timeout, _read_dm_role_auth_guild)
+    _DISCORD_PROMPT_TIMEOUT_DEFAULT, _DISCORD_PROMPT_TIMEOUT_MIN, _read_discord_prompt_timeout, _read_dm_role_auth_guild,
+    _resolve_exec_approval_admin_gate)
 from plugins.platforms.discord.adapter_exec_approval_view import build_exec_approval_view
 
 
@@ -6362,24 +6363,6 @@ def _silent_unauthorized_interactions() -> bool:
     return _scoped_gate_env("DISCORD_UNAUTHORIZED_INTERACTION_BEHAVIOR").strip().lower() == "ignore"
 
 
-def _resolve_exec_approval_admin_gate(config_extra: Optional[dict]) -> tuple[bool, set]:
-    """Resolve the exec-approval admin gate from ``extra``; returns ``(require_admin, admin_user_ids)``.
-    Default OFF (user-scope buttons). When ``require_admin_for_exec_approval`` is true only
-    ``allow_admin_from`` ids may click; on with no admins -> ``(True, set())`` (fail closed, log once).
-    """
-    extra = config_extra if isinstance(config_extra, dict) else {}
-    raw_toggle = extra.get("require_admin_for_exec_approval", False)
-    require_admin = str(raw_toggle).strip().lower() in {"true", "1", "yes"}
-    if not require_admin:
-        return (False, set())
-    try:
-        from gateway.slash_access import _coerce_id_list
-        admin_ids = set(_coerce_id_list(extra.get("allow_admin_from")))
-    except Exception:
-        admin_ids = set()
-    return (True, admin_ids)
-
-
 def _define_discord_view_classes() -> None:
     """Register Discord UI view classes as module globals.
     Called at module load and after a lazy install so the classes exist whenever DISCORD_AVAILABLE."""
@@ -6479,6 +6462,9 @@ def _define_discord_view_classes() -> None:
                     item.label = _t_discord(key, _DISCORD_BUTTON_LABEL_LIMIT)
 
         async def on_timeout(self):
+            # stop() can't cancel an on_timeout discord.py queued in the tick a click landed: keep the answer.
+            if self.resolved:
+                return
             self.resolved = True
             self._disable_all()
             await self._expire_embed(t("platform.discord.prompt.expired_footer"))
@@ -6695,6 +6681,7 @@ def _define_discord_view_classes() -> None:
             if not await self._gate(interaction, resolved_msg=t("platform.discord.picker.already_resolved"), unauth_msg=_unauthorized()):
                 return
             self.resolved = True
+            self.stop()  # answered: release the view and its timeout now, before any await
             self.clear_items()
             await self._edit(
                 interaction, t("platform.discord.picker.switching", model=model_id),
@@ -6746,10 +6733,14 @@ def _define_discord_view_classes() -> None:
             if not await self._gate(interaction, resolved_msg=None, unauth_msg=_unauthorized()):
                 return
             self.resolved = True
+            self.stop()  # answered: release the view and its timeout now, before any await
             self.clear_items()
             await self._edit(interaction, t("platform.discord.picker.cancelled"), color=discord.Color.greyple())
 
         async def on_timeout(self):
+            # stop() can't cancel an on_timeout discord.py queued in the tick a click landed: keep the answer.
+            if self.resolved:
+                return
             self.resolved = True
             self.clear_items()
             msg = self._message
