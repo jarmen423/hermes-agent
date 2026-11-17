@@ -517,6 +517,9 @@ class _Rewriter(cst.CSTTransformer):
             self._flag(node, MODULE_STRING, text, "module-name prefix outside any import; rewrite or confirm by hand")
         elif key in self.found.path_pieces and text in self.plan.moved.folders:
             self._flag(node, BY_PATH, text, "path built from a moved folder name; check the path arithmetic")
+        elif key in self.found.join_pieces and text in self.plan.moved.departed_files:
+            self._flag(node, BY_PATH, text, "path joined to the name of a file that left its folder; check the path "
+                                            "arithmetic")
         elif (found := self.plan.moved.find_path(text)) is not None:
             self._flag(node, BY_PATH, found[0], f"string names a moved path (now {found[1]})")
 
@@ -782,7 +785,8 @@ def _work(item: tuple[Path, str]) -> Result:
 
 def _candidates(root: Path, paths: list[str], plan: Plan) -> list[str]:
     listed = git(root, "ls-files", "--", *(paths or ["."])).splitlines()
-    words = {old.split(".")[0] for old in plan.renames} | {old.rstrip("/") for old, _ in plan.moved.old_paths()}
+    words = {old.split(".")[0] for old in plan.renames} | {old.rstrip("/") for old, _ in plan.moved.old_paths()} \
+        | plan.moved.departed_files
     needle = re.compile("|".join(re.escape(w) for w in sorted(words, key=len, reverse=True)))
     out = []
     for path in listed:
