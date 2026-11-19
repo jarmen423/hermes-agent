@@ -704,12 +704,21 @@ for p in list_providers():
 
 ## Testing your plugin
 
-Point `HERMES_HOME` at a temp directory so you don't pollute your real config:
+Point `HERMES_HOME` at a throwaway directory so you don't pollute your real config, then
+write `$HERMES_HOME/plugins/model-providers/my-provider/__init__.py` (an agent uses
+`write_file`, which creates the directory):
 
 ```bash
-export HERMES_HOME=$HOME/.hermes/cache/scratch/hermes-plugin-test
-mkdir -p $HERMES_HOME/plugins/model-providers/my-provider
-cat > $HERMES_HOME/plugins/model-providers/my-provider/__init__.py <<'EOF'
+export HERMES_HOME=$HOME/hermes-plugin-test
+```
+
+Keep that directory out of `~/.hermes/cache/scratch` and other temp directories that are
+cleaned by age: a running Hermes imports your plugin from a copy under the Hermes root's
+`runtime/provider-plugins/` (`$HERMES_HOME` itself, or the root above `profiles/` for a named
+profile), and a cleaner that deletes it makes the plugin's later imports fail until the
+process restarts.
+
+```python
 from providers import register_provider
 from providers.base import ProviderProfile
 register_provider(ProviderProfile(
@@ -718,8 +727,9 @@ register_provider(ProviderProfile(
     base_url="https://api.my-provider.example.com/v1",
     auth_type="api_key",
 ))
-EOF
+```
 
+```bash
 export MY_API_KEY=your-test-key
 hermes -z "hello" --provider my-provider -m some-model
 ```
