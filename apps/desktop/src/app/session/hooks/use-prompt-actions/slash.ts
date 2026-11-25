@@ -79,7 +79,7 @@ import { queueKickoffIfSessionBusy } from './queue-if-busy'
 import { resolveTargetSessionId } from './resolve-target-session'
 import { desktopReadCommandHandlers } from './slash-desktop-commands'
 import { sessionCommandHandlers } from './slash-session-commands'
-import { captureSubmissionDestination } from './submission-destination'
+import { captureSubmissionDestination, SubmissionDestinationChangedError } from './submission-destination'
 import {
   type GatewayRequest,
   isSessionIdCandidate,
@@ -99,6 +99,13 @@ import {
 // host is still compressing (#97948).
 export const SESSION_COMPRESS_TIMEOUT_MS = 660_000
 const WAKE_START_TIMEOUT_MS = 180_000
+
+/** A route that refused the command outright (the gateway knows no such command) or never received
+ * it (the destination guard stopped it in the renderer). A timeout or worker crash is not one: the
+ * command may have run, so retrying it from a restored draft could run it twice. */
+function commandDidNotRun(error: unknown): boolean {
+  return error instanceof SubmissionDestinationChangedError || jsonRpcErrorReason(error) === 'unsupported_command'
+}
 
 function slashDispatchErrorText(name: string, execError: unknown, dispatchError: unknown): string {
   const dispatchMessage = dispatchError instanceof Error ? dispatchError.message : String(dispatchError)
@@ -323,6 +330,8 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
         if (!sessionId) {
           notify({ kind: 'error', title: copy.sessionUnavailable, message: copy.createSessionFailed })
+          // No session means the command never ran: hand the words back to the composer.
+          submitted = false
 
           return null
         }
@@ -586,11 +595,8 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
           await handleDispatch(dispatch)
         } catch (err) {
-          // Only let the composer restore a retry when both routes definitively refused the command.
-          if (
-            jsonRpcErrorReason(slashExecError) === 'unsupported_command' &&
-            jsonRpcErrorReason(err) === 'unsupported_command'
-          ) {
+          // Only let the composer restore a retry when both routes definitively did not run the command.
+          if (commandDidNotRun(slashExecError) && commandDidNotRun(err)) {
             submitted = false
           }
 
@@ -761,6 +767,11 @@ export function useSlashCommand(deps: SlashCommandDeps) {
               return
             }
 
+            if (err instanceof SubmissionDestinationChangedError) {
+              // Refused before it was sent: give the question back instead of dropping it.
+              submitted = false
+            }
+
             renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
           }
         },
@@ -811,6 +822,11 @@ export function useSlashCommand(deps: SlashCommandDeps) {
               await runExec(ctx)
 
               return
+            }
+
+            if (err instanceof SubmissionDestinationChangedError) {
+              // Refused before it was sent: give the prompt back instead of dropping it.
+              submitted = false
             }
 
             renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
